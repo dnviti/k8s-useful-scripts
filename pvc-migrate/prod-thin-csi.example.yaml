@@ -1,0 +1,44 @@
+execution:
+  confirm: false
+  dryRun: true
+  stepPauses: true
+
+cluster:
+  kubeconfigPath: /root/.kube/config-prod
+
+migration:
+  targetStorageClass: thin-csi
+  sourceStorageClassRegex: "^thin$"
+  setDefaultStorageClass: true
+  runSmokeTest: true
+  copyImage: registry.access.redhat.com/ubi9/ubi:latest
+  dataBackupStorageClass: ""
+  keepDataBackups: true
+  backupBaseDir: /root/pvc-migration/prod-migration
+  workloadStopTimeout: 1800
+  workloadReadyTimeout: 1800
+  copyTimeout: 14400
+  skipUnsupportedClaims: false
+
+scope:
+  includeNamespacesRegex: "^namespace-name$"
+  excludeNamespacesRegex: "^$"
+  includeClaimsRegex: ".*"
+  excludeClaimsRegex: "^$"
+
+verify:
+  cns: false
+  cnsDatastore: ""
+  clusterOperators: auto
+
+handlers:
+  imageRegistry:
+    enabled: false
+    namespace: openshift-image-registry
+    configName: cluster
+  clusterMonitoring:
+    enabled: false
+    namespace: openshift-monitoring
+    configMap: cluster-monitoring-config
+    clusterMonitoringOperatorDeployment: cluster-monitoring-operator
+    prometheusOperatorDeployment: prometheus-operator
