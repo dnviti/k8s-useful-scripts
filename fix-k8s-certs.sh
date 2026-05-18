@@ -1,35 +1,35 @@
 #!/bin/bash
 ###############################################################################
 # fix-k8s-certs.sh
-# Script unificato per verificare e rigenerare i certificati su cluster
-# OpenShift (OCP) e RKE2.
+# Unified script to check and regenerate certificates on OpenShift (OCP)
+# and RKE2 clusters.
 #
-# Il tipo di piattaforma viene rilevato automaticamente oppure può essere
-# forzato con --platform=ocp|rke2.
+# The platform type is detected automatically, or it can be forced with
+# --platform=ocp|rke2.
 #
-# Uso: ./fix-k8s-certs.sh [OPZIONI]
+# Usage: ./fix-k8s-certs.sh [OPTIONS]
 #
-# Opzioni comuni:
-#   --kubeconfig=PATH         Path al kubeconfig (supporto multi-ambiente)
-#   --platform=ocp|rke2       Forza la piattaforma (default: auto-detect)
-#   --check-only              Solo verifica, nessuna modifica
+# Common options:
+#   --kubeconfig=PATH         Path to kubeconfig (multi-environment support)
+#   --platform=ocp|rke2       Force platform (default: auto-detect)
+#   --check-only              Check only, do not make changes
 #
-# Opzioni OCP:
-#   --force-selfsigned        Genera subito un self-signed senza attendere
-#   --fix-imagepull           Patch IfNotPresent per cluster air-gapped
+# OCP options:
+#   --force-selfsigned        Immediately generate a self-signed cert without waiting
+#   --fix-imagepull           Patch IfNotPresent for air-gapped clusters
 #
-# Opzioni RKE2:
-#   --fix-controlplane        Rigenera i certificati del control plane
-#   --fix-ingress             Rigenera il certificato wildcard dell'ingress
-#   --fix-all                 Equivalente a --fix-controlplane --fix-ingress
-#   --ingress-domain=FQDN    Dominio wildcard per l'ingress
-#   --rke2-data-dir=PATH     Directory dati RKE2 (default: /var/lib/rancher/rke2)
+# RKE2 options:
+#   --fix-controlplane        Regenerate control plane certificates
+#   --fix-ingress             Regenerate the ingress wildcard certificate
+#   --fix-all                 Equivalent to --fix-controlplane --fix-ingress
+#   --ingress-domain=FQDN     Wildcard domain for ingress
+#   --rke2-data-dir=PATH      RKE2 data directory (default: /var/lib/rancher/rke2)
 ###############################################################################
 
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Colori e funzioni di output
+# Colors and output functions
 # ─────────────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -41,62 +41,62 @@ NC='\033[0m'
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()     { echo -e "${RED}[ERRORE]${NC} $*"; }
+err()     { echo -e "${RED}[ERROR]${NC} $*"; }
 step()    { echo -e "\n${GREEN}━━━ STEP $1 ━━━${NC} $2"; }
 divider() { echo -e "${CYAN}──────────────────────────────────────────────────${NC}"; }
 banner()  { echo -e "${BOLD}${CYAN}$*${NC}"; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Help (prima di tutto, non richiede dipendenze)
+# Help (first, does not require dependencies)
 # ─────────────────────────────────────────────────────────────────────────────
 for arg in "$@"; do
   if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
     cat <<'EOF'
-Uso: fix-k8s-certs.sh [OPZIONI]
+Usage: fix-k8s-certs.sh [OPTIONS]
 
-Opzioni comuni:
-  --kubeconfig=PATH         Path al kubeconfig (supporto multi-ambiente)
-  --platform=ocp|rke2       Forza la piattaforma (default: auto-detect)
-  --check-only              Solo verifica certificati, nessuna modifica
-  --auto                    Modalità non-interattiva (no input utente):
-                            rinnova solo se il cert scade entro la soglia,
-                            altrimenti esce senza modifiche. Ideale per cron.
-  --auto-threshold=DAYS     Soglia in giorni per --auto (default: 7)
+Common options:
+  --kubeconfig=PATH         Path to kubeconfig (multi-environment support)
+  --platform=ocp|rke2       Force platform (default: auto-detect)
+  --check-only              Check certificates only, do not make changes
+  --auto                    Non-interactive mode (no user input):
+                            renew only if the cert expires within the threshold,
+                            otherwise exit without changes. Ideal for cron.
+  --auto-threshold=DAYS     Threshold in days for --auto (default: 7)
 
-Opzioni OpenShift (OCP):
-  --force-selfsigned        Genera subito un certificato self-signed
+OpenShift (OCP) options:
+  --force-selfsigned        Immediately generate a self-signed certificate
   --fix-imagepull           Patch imagePullPolicy=IfNotPresent (air-gapped)
 
-Opzioni RKE2:
-  --fix-controlplane        Rigenera i certificati del control plane
-  --fix-ingress             Rigenera il certificato wildcard dell'ingress
+RKE2 options:
+  --fix-controlplane        Regenerate control plane certificates
+  --fix-ingress             Regenerate the ingress wildcard certificate
   --fix-all                 Fix control plane + ingress
-  --ingress-domain=FQDN    Dominio wildcard (es: apps.mycluster.it)
-  --rke2-data-dir=PATH     Directory dati RKE2 (default: /var/lib/rancher/rke2)
+  --ingress-domain=FQDN     Wildcard domain (for example: apps.mycluster.it)
+  --rke2-data-dir=PATH      RKE2 data directory (default: /var/lib/rancher/rke2)
 
-Esempi:
+Examples:
   # OpenShift — auto-detect
   ./fix-k8s-certs.sh --kubeconfig=/path/to/ocp-prod.kubeconfig
 
-  # OpenShift — air-gapped con self-signed forzato
+  # OpenShift — air-gapped with forced self-signed certificate
   ./fix-k8s-certs.sh --kubeconfig=/path/to/ocp.kubeconfig --force-selfsigned --fix-imagepull
 
-  # RKE2 — solo verifica
+  # RKE2 — check only
   ./fix-k8s-certs.sh --kubeconfig=/path/to/rke2-prod.yaml --check-only
 
-  # RKE2 — fix completo
+  # RKE2 — full fix
   ./fix-k8s-certs.sh --kubeconfig=/path/to/rke2.yaml --fix-all --ingress-domain=apps.example.com
 
-  # Forza piattaforma
+  # Force platform
   ./fix-k8s-certs.sh --platform=rke2 --kubeconfig=/path/to/kubeconfig --fix-controlplane
 
-  # Cron job: rinnova OCP solo se scade entro 7gg (default)
+  # Cron job: renew OCP only if it expires within 7 days (default)
   ./fix-k8s-certs.sh --auto --kubeconfig=/path/to/ocp.kubeconfig
 
-  # Cron job: rinnova OCP solo se scade entro 30gg
+  # Cron job: renew OCP only if it expires within 30 days
   ./fix-k8s-certs.sh --auto --auto-threshold=30 --kubeconfig=/path/to/ocp.kubeconfig
 
-  # Cron job: rinnova RKE2 control plane + ingress
+  # Cron job: renew RKE2 control plane + ingress
   ./fix-k8s-certs.sh --auto --kubeconfig=/path/to/rke2.yaml --fix-all --ingress-domain=apps.example.com
 EOF
     exit 0
@@ -104,7 +104,7 @@ EOF
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Verifica dipendenze
+# Dependency checks
 # ─────────────────────────────────────────────────────────────────────────────
 REQUIRED_TOOLS=(openssl jq base64 date sed grep tr mktemp)
 OPTIONAL_TOOLS=(oc kubectl crictl systemctl awk wc)
@@ -124,7 +124,7 @@ for tool in "${OPTIONAL_TOOLS[@]}"; do
 done
 
 if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
-  echo -e "${RED}[ERRORE]${NC} Tool obbligatori mancanti: ${MISSING_TOOLS[*]}"
+  echo -e "${RED}[ERROR]${NC} Missing required tools: ${MISSING_TOOLS[*]}"
   echo ""
   echo "  RHEL/CentOS/Fedora:  sudo dnf install -y jq openssl coreutils"
   echo "  Debian/Ubuntu:       sudo apt install -y jq openssl coreutils"
@@ -132,13 +132,13 @@ if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
   exit 1
 fi
 
-echo -e "${GREEN}[OK]${NC}    Tool obbligatori: ${REQUIRED_TOOLS[*]}"
+echo -e "${GREEN}[OK]${NC}    Required tools: ${REQUIRED_TOOLS[*]}"
 if [[ ${#MISSING_OPTIONAL[@]} -gt 0 ]]; then
-  echo -e "${YELLOW}[WARN]${NC}  Tool opzionali mancanti: ${MISSING_OPTIONAL[*]}"
+  echo -e "${YELLOW}[WARN]${NC}  Missing optional tools: ${MISSING_OPTIONAL[*]}"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parsing argomenti
+# Argument parsing
 # ─────────────────────────────────────────────────────────────────────────────
 PLATFORM=""
 KUBECONFIG_PATH=""
@@ -159,7 +159,7 @@ WARN_DAYS=30
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    # Comuni
+    # Common
     --platform=*)           PLATFORM="${1#*=}"; shift ;;
     --platform)             PLATFORM="${2:-}"; shift 2 ;;
     --kubeconfig=*)         KUBECONFIG_PATH="${1#*=}"; shift ;;
@@ -180,14 +180,14 @@ while [[ $# -gt 0 ]]; do
     --rke2-data-dir=*)      RKE2_DATA_DIR="${1#*=}"; shift ;;
     --rke2-data-dir)        RKE2_DATA_DIR="${2:-}"; shift 2 ;;
     -h|--help)              exit 0 ;;
-    *) err "Opzione sconosciuta: $1"; exit 1 ;;
+    *) err "Unknown option: $1"; exit 1 ;;
   esac
 done
 
-# Validazione --auto-threshold
+# --auto-threshold validation
 if [[ "$AUTO_MODE" == true ]]; then
   if ! [[ "$AUTO_THRESHOLD_DAYS" =~ ^[0-9]+$ ]] || [[ "$AUTO_THRESHOLD_DAYS" -lt 1 ]]; then
-    err "--auto-threshold deve essere un numero intero positivo (ricevuto: '$AUTO_THRESHOLD_DAYS')"
+    err "--auto-threshold must be a positive integer (received: '$AUTO_THRESHOLD_DAYS')"
     exit 1
   fi
 fi
@@ -197,19 +197,19 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ -n "$KUBECONFIG_PATH" ]]; then
   if [[ ! -f "$KUBECONFIG_PATH" ]]; then
-    err "Kubeconfig non trovato: $KUBECONFIG_PATH"
+    err "Kubeconfig not found: $KUBECONFIG_PATH"
     exit 1
   fi
   export KUBECONFIG="$KUBECONFIG_PATH"
   ok "Kubeconfig: $KUBECONFIG_PATH"
 elif [[ -n "${KUBECONFIG:-}" ]]; then
-  info "Kubeconfig da env: $KUBECONFIG"
+  info "Kubeconfig from environment: $KUBECONFIG"
 else
-  # Auto-detect per RKE2
+  # Auto-detect for RKE2
   for KC in /etc/rancher/rke2/rke2.yaml "$HOME/.kube/config"; do
     if [[ -f "$KC" ]]; then
       export KUBECONFIG="$KC"
-      info "Kubeconfig auto-rilevato: $KC"
+      info "Auto-detected kubeconfig: $KC"
       break
     fi
   done
@@ -219,7 +219,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rileva CLI disponibile (oc o kubectl)
+# Detect available CLI (oc or kubectl)
 # ─────────────────────────────────────────────────────────────────────────────
 KUBECTL=""
 if command -v oc &>/dev/null; then
@@ -233,39 +233,39 @@ elif [[ -x /var/lib/rancher/rke2/bin/kubectl ]]; then
 fi
 
 if [[ -z "$KUBECTL" ]]; then
-  err "Nessun client Kubernetes trovato (oc o kubectl). Installane uno."
+  err "No Kubernetes client found (oc or kubectl). Install one."
   exit 1
 fi
-ok "CLI Kubernetes: $KUBECTL"
+ok "Kubernetes CLI: $KUBECTL"
 
-# Verifica connessione
+# Check connection
 CLUSTER_ACCESS=false
 if $KUBECTL cluster-info &>/dev/null 2>&1; then
   CLUSTER_ACCESS=true
-  ok "Connessione al cluster: attiva"
+  ok "Cluster connection: active"
 else
-  # Per OCP prova oc whoami
+  # For OCP, try oc whoami
   if [[ "$KUBECTL" == "oc" ]] && oc whoami &>/dev/null 2>&1; then
     CLUSTER_ACCESS=true
-    ok "Connessione al cluster: attiva (oc)"
+    ok "Cluster connection: active (oc)"
   else
-    err "Impossibile connettersi al cluster. Verifica kubeconfig e connettività."
+    err "Unable to connect to the cluster. Check kubeconfig and connectivity."
     exit 1
   fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Auto-detect piattaforma
+# Auto-detect platform
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ -z "$PLATFORM" ]]; then
-  info "Rilevamento piattaforma..."
+  info "Detecting platform..."
 
-  # Metodo 1: risorse OCP-specifiche
+  # Method 1: OCP-specific resources
   if $KUBECTL get clusteroperators &>/dev/null 2>&1; then
     PLATFORM="ocp"
-  # Metodo 2: verifica nodi con label RKE2
+  # Method 2: check nodes with RKE2 labels
   elif $KUBECTL get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' 2>/dev/null | grep -qi "containerd"; then
-    # Verifica se è RKE2 guardando i pod
+    # Check whether it is RKE2 by looking at pods
     if $KUBECTL get pods -n kube-system -l app.kubernetes.io/name=rke2 &>/dev/null 2>&1 || \
        [[ -d "$RKE2_DATA_DIR/server/tls" ]] || \
        systemctl list-units --type=service 2>/dev/null | grep -q rke2; then
@@ -273,7 +273,7 @@ if [[ -z "$PLATFORM" ]]; then
     fi
   fi
 
-  # Metodo 3: filesystem locale
+  # Method 3: local filesystem
   if [[ -z "$PLATFORM" ]]; then
     if [[ -d "$RKE2_DATA_DIR/server/tls" ]]; then
       PLATFORM="rke2"
@@ -281,30 +281,30 @@ if [[ -z "$PLATFORM" ]]; then
   fi
 
   if [[ -z "$PLATFORM" ]]; then
-    err "Impossibile rilevare la piattaforma. Specifica --platform=ocp oppure --platform=rke2"
+    err "Unable to detect platform. Specify --platform=ocp or --platform=rke2"
     exit 1
   fi
 fi
 
-# Validazione
+# Validation
 case "$PLATFORM" in
   ocp|openshift)  PLATFORM="ocp" ;;
   rke2|rancher)   PLATFORM="rke2" ;;
   *)
-    err "Piattaforma non supportata: $PLATFORM (usa: ocp, rke2)"
+    err "Unsupported platform: $PLATFORM (use: ocp, rke2)"
     exit 1
     ;;
 esac
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Funzioni comuni
+# Common functions
 # ─────────────────────────────────────────────────────────────────────────────
 check_cert_file() {
   local CERT_PATH="$1"
   local CERT_NAME="$2"
 
   if [[ ! -f "$CERT_PATH" ]]; then
-    warn "$CERT_NAME: file non trovato ($CERT_PATH)"
+    warn "$CERT_NAME: file not found ($CERT_PATH)"
     return 1
   fi
 
@@ -313,7 +313,7 @@ check_cert_file() {
   SUBJECT=$(openssl x509 -in "$CERT_PATH" -noout -subject 2>/dev/null | sed 's/subject=//' || echo "N/A")
 
   if [[ -z "$NOT_AFTER" ]]; then
-    warn "$CERT_NAME: impossibile leggere il certificato"
+    warn "$CERT_NAME: unable to read certificate"
     return 1
   fi
 
@@ -322,15 +322,15 @@ check_cert_file() {
   DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
 
   if (( DAYS_LEFT < 0 )); then
-    err "$CERT_NAME: SCADUTO da $(( DAYS_LEFT * -1 )) giorni ($NOT_AFTER)"
+    err "$CERT_NAME: EXPIRED $(( DAYS_LEFT * -1 )) days ago ($NOT_AFTER)"
     echo "     Subject: $SUBJECT"
     return 2
   elif (( DAYS_LEFT < WARN_DAYS )); then
-    warn "$CERT_NAME: scade tra $DAYS_LEFT giorni ($NOT_AFTER)"
+    warn "$CERT_NAME: expires in $DAYS_LEFT days ($NOT_AFTER)"
     echo "     Subject: $SUBJECT"
     return 3
   else
-    ok "$CERT_NAME: valido, scade tra $DAYS_LEFT giorni ($NOT_AFTER)"
+    ok "$CERT_NAME: valid, expires in $DAYS_LEFT days ($NOT_AFTER)"
     return 0
   fi
 }
@@ -345,7 +345,7 @@ check_cert_secret() {
   CERT_DATA=$($KUBECTL get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath="{$JSONPATH}" 2>/dev/null || echo "")
 
   if [[ -z "$CERT_DATA" ]]; then
-    warn "$CERT_NAME: secret $SECRET_NAME non trovato in $NAMESPACE"
+    warn "$CERT_NAME: secret $SECRET_NAME not found in $NAMESPACE"
     return 1
   fi
 
@@ -354,7 +354,7 @@ check_cert_secret() {
   SUBJECT=$(echo "$CERT_DATA" | base64 -d | openssl x509 -noout -subject 2>/dev/null | sed 's/subject=//' || echo "N/A")
 
   if [[ -z "$NOT_AFTER" ]]; then
-    warn "$CERT_NAME: impossibile decodificare il certificato"
+    warn "$CERT_NAME: unable to decode certificate"
     return 1
   fi
 
@@ -363,15 +363,15 @@ check_cert_secret() {
   DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
 
   if (( DAYS_LEFT < 0 )); then
-    err "$CERT_NAME: SCADUTO da $(( DAYS_LEFT * -1 )) giorni ($NOT_AFTER)"
+    err "$CERT_NAME: EXPIRED $(( DAYS_LEFT * -1 )) days ago ($NOT_AFTER)"
     echo "     Subject: $SUBJECT"
     return 2
   elif (( DAYS_LEFT < WARN_DAYS )); then
-    warn "$CERT_NAME: scade tra $DAYS_LEFT giorni ($NOT_AFTER)"
+    warn "$CERT_NAME: expires in $DAYS_LEFT days ($NOT_AFTER)"
     echo "     Subject: $SUBJECT"
     return 3
   else
-    ok "$CERT_NAME: valido, scade tra $DAYS_LEFT giorni ($NOT_AFTER)"
+    ok "$CERT_NAME: valid, expires in $DAYS_LEFT days ($NOT_AFTER)"
     return 0
   fi
 }
@@ -388,24 +388,24 @@ generate_selfsigned_cert() {
     -subj "/CN=*.$DOMAIN" \
     -addext "subjectAltName=DNS:*.$DOMAIN,DNS:$DOMAIN" 2>/dev/null
 
-  ok "Certificato self-signed generato (*.$DOMAIN, validità ${DAYS}gg)"
+  ok "Generated self-signed certificate (*.$DOMAIN, validity ${DAYS} days)"
   openssl x509 -in "$OUTDIR/wildcard.crt" -noout -dates
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  AVVIO
+#  START
 # ═══════════════════════════════════════════════════════════════════════════════
 divider
-banner "fix-k8s-certs.sh — Piattaforma: ${PLATFORM^^} — $(date)"
+banner "fix-k8s-certs.sh — Platform: ${PLATFORM^^} — $(date)"
 
 if [[ "$AUTO_MODE" == true ]]; then
-  info "Modalità: AUTO (non-interattiva, soglia rinnovo: ${AUTO_THRESHOLD_DAYS} giorni)"
+  info "Mode: AUTO (non-interactive, renewal threshold: ${AUTO_THRESHOLD_DAYS} days)"
 fi
 
 if [[ "$PLATFORM" == "ocp" ]]; then
   CLUSTER_USER=$($KUBECTL whoami 2>/dev/null || echo "N/A")
   CLUSTER_API=$($KUBECTL whoami --show-server 2>/dev/null || echo "N/A")
-  info "Utente:  $CLUSTER_USER"
+  info "User:    $CLUSTER_USER"
   info "Cluster: $CLUSTER_API"
 else
   info "Cluster: $($KUBECTL cluster-info 2>/dev/null | head -1 | sed 's/\x1b\[[0-9;]*m//g' || echo 'N/A')"
@@ -413,26 +413,26 @@ fi
 divider
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FLUSSO OCP
+#  OCP FLOW
 # ═══════════════════════════════════════════════════════════════════════════════
 if [[ "$PLATFORM" == "ocp" ]]; then
 
-  # ── STEP 1: Rileva dominio ──
-  step 1 "Rilevamento dominio wildcard apps"
+  # ── STEP 1: Detect domain ──
+  step 1 "Detecting wildcard apps domain"
 
   APPS_DOMAIN=$($KUBECTL get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || true)
   if [[ -z "$APPS_DOMAIN" ]]; then
     APPS_DOMAIN=$($KUBECTL get route console -n openshift-console -o jsonpath='{.spec.host}' 2>/dev/null | sed 's/^console-openshift-console\.//')
   fi
   if [[ -z "$APPS_DOMAIN" ]]; then
-    err "Impossibile determinare il dominio apps del cluster."
+    err "Unable to determine the cluster apps domain."
     exit 1
   fi
-  ok "Dominio: $APPS_DOMAIN"
+  ok "Domain: $APPS_DOMAIN"
   WILDCARD_CN="*.$APPS_DOMAIN"
 
-  # ── STEP 2: Verifica certificato ──
-  step 2 "Verifica certificato attuale del router"
+  # ── STEP 2: Check certificate ──
+  step 2 "Checking current router certificate"
 
   CERT_DATA=$($KUBECTL get secret router-certs-default -n openshift-ingress \
     -o jsonpath='{.data.tls\.crt}' 2>/dev/null || true)
@@ -447,43 +447,43 @@ if [[ "$PLATFORM" == "ocp" ]]; then
 
       if (( EXPIRY_EPOCH > NOW_EPOCH )); then
         DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
-        ok "Il certificato è ancora valido (scade tra $DAYS_LEFT giorni: $NOT_AFTER)"
+        ok "The certificate is still valid (expires in $DAYS_LEFT days: $NOT_AFTER)"
 
         if [[ "$CHECK_ONLY" == true ]]; then
-          info "Modalità check-only — nessuna modifica."
+          info "Check-only mode — no changes."
           exit 0
         fi
 
         if [[ "$AUTO_MODE" == true ]]; then
           if (( DAYS_LEFT <= AUTO_THRESHOLD_DAYS )); then
-            warn "Modalità auto: il certificato scade tra $DAYS_LEFT giorni (soglia: ${AUTO_THRESHOLD_DAYS}gg) — procedo al rinnovo"
+            warn "Auto mode: certificate expires in $DAYS_LEFT days (threshold: ${AUTO_THRESHOLD_DAYS} days) — proceeding with renewal"
           else
-            ok "Modalità auto: il certificato scade tra $DAYS_LEFT giorni (soglia: ${AUTO_THRESHOLD_DAYS}gg) — nessun intervento necessario"
+            ok "Auto mode: certificate expires in $DAYS_LEFT days (threshold: ${AUTO_THRESHOLD_DAYS} days) — no action needed"
             exit 0
           fi
         else
           echo ""
-          read -rp "Vuoi continuare comunque con la rigenerazione? (s/N) " REPLY
+          read -rp "Do you want to continue with regeneration anyway? (y/N) " REPLY
           if [[ ! "$REPLY" =~ ^[sSyY]$ ]]; then
-            info "Operazione annullata."
+            info "Operation canceled."
             exit 0
           fi
         fi
       else
-        warn "Certificato SCADUTO il $NOT_AFTER"
+        warn "Certificate EXPIRED on $NOT_AFTER"
         if [[ "$AUTO_MODE" == true ]]; then
-          info "Modalità auto: certificato scaduto — procedo al rinnovo"
+          info "Auto mode: certificate expired — proceeding with renewal"
         fi
       fi
     else
-      warn "Impossibile decodificare il certificato attuale"
+      warn "Unable to decode current certificate"
     fi
   else
-    warn "Secret router-certs-default non trovato in openshift-ingress"
+    warn "Secret router-certs-default not found in openshift-ingress"
   fi
 
-  # ── STEP 3: Stato operator ──
-  step 3 "Stato attuale degli operator impattati"
+  # ── STEP 3: Operator status ──
+  step 3 "Current status of impacted operators"
 
   for OP in authentication console ingress; do
     STATUS=$($KUBECTL get co "$OP" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "Unknown")
@@ -497,25 +497,25 @@ if [[ "$PLATFORM" == "ocp" ]]; then
 
   if [[ "$CHECK_ONLY" == true ]]; then
     divider
-    info "Modalità check-only — nessuna modifica applicata."
+    info "Check-only mode — no changes applied."
     exit 0
   fi
 
-  # ── STEP 4: Elimina secret router ──
-  step 4 "Eliminazione secret router-certs-default"
+  # ── STEP 4: Delete router secret ──
+  step 4 "Deleting secret router-certs-default"
 
   if $KUBECTL get secret router-certs-default -n openshift-ingress &>/dev/null; then
     $KUBECTL delete secret router-certs-default -n openshift-ingress
-    ok "Secret eliminato da openshift-ingress"
+    ok "Secret deleted from openshift-ingress"
   else
-    info "Secret già assente in openshift-ingress"
+    info "Secret already absent in openshift-ingress"
   fi
 
-  # ── STEP 5: Riavvia ingress-operator ──
-  step 5 "Riavvio ingress-operator"
+  # ── STEP 5: Restart ingress-operator ──
+  step 5 "Restarting ingress-operator"
 
   $KUBECTL delete pods --all -n openshift-ingress-operator 2>/dev/null || true
-  info "Pod eliminati, attendo il restart..."
+  info "Pods deleted, waiting for restart..."
   sleep 5
 
   for i in $(seq 1 30); do
@@ -529,19 +529,19 @@ if [[ "$PLATFORM" == "ocp" ]]; then
   done
   echo ""
 
-  # ── STEP 6: Attendi rigenerazione o forza self-signed ──
-  step 6 "Attesa rigenerazione certificato"
+  # ── STEP 6: Wait for regeneration or force self-signed ──
+  step 6 "Waiting for certificate regeneration"
 
   CERT_REGENERATED=false
 
   if [[ "$FORCE_SELFSIGNED" == false ]]; then
-    info "Attendo che l'ingress-operator rigeneri il secret (max 60s)..."
+    info "Waiting for the ingress-operator to regenerate the secret (max 60s)..."
     for i in $(seq 1 12); do
       if $KUBECTL get secret router-certs-default -n openshift-ingress &>/dev/null; then
         NEW_DATES=$($KUBECTL get secret router-certs-default -n openshift-ingress \
           -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates 2>/dev/null || true)
         if [[ -n "$NEW_DATES" ]]; then
-          ok "Secret rigenerato automaticamente dall'operator"
+          ok "Secret automatically regenerated by the operator"
           echo "$NEW_DATES"
           CERT_REGENERATED=true
           break
@@ -554,7 +554,7 @@ if [[ "$PLATFORM" == "ocp" ]]; then
   fi
 
   if [[ "$CERT_REGENERATED" == false ]]; then
-    warn "Rigenerazione automatica non avvenuta — creo certificato self-signed"
+    warn "Automatic regeneration did not happen — creating self-signed certificate"
     TMPDIR=$(mktemp -d)
     generate_selfsigned_cert "$APPS_DOMAIN" "$TMPDIR"
 
@@ -562,52 +562,52 @@ if [[ "$PLATFORM" == "ocp" ]]; then
       --cert="$TMPDIR/wildcard.crt" \
       --key="$TMPDIR/wildcard.key" \
       -n openshift-ingress
-    ok "Secret router-certs-default creato"
+    ok "Secret router-certs-default created"
     rm -rf "$TMPDIR"
   fi
 
-  # ── STEP 7: Riavvia router pods ──
-  step 7 "Riavvio router pods"
+  # ── STEP 7: Restart router pods ──
+  step 7 "Restarting router pods"
 
   $KUBECTL rollout restart deployment/router-default -n openshift-ingress 2>/dev/null || \
     $KUBECTL delete pods --all -n openshift-ingress 2>/dev/null || true
-  info "Attendo che i router siano pronti..."
+  info "Waiting for routers to become ready..."
   $KUBECTL rollout status deployment/router-default -n openshift-ingress --timeout=120s 2>/dev/null || \
-    warn "Timeout rollout router — potrebbe richiedere più tempo"
-  ok "Router riavviati"
+    warn "Router rollout timed out — it may take more time"
+  ok "Routers restarted"
 
-  # ── STEP 8: Propaga a config-managed ──
-  step 8 "Propagazione certificato a openshift-config-managed"
+  # ── STEP 8: Propagate to config-managed ──
+  step 8 "Propagating certificate to openshift-config-managed"
 
   $KUBECTL delete secret router-certs-default -n openshift-config-managed 2>/dev/null || true
   $KUBECTL get secret router-certs-default -n openshift-ingress -o json | \
     jq '.metadata.namespace = "openshift-config-managed" |
         del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields)' | \
     $KUBECTL apply -f -
-  ok "Secret copiato in openshift-config-managed"
+  ok "Secret copied to openshift-config-managed"
 
-  # ── STEP 9: Pulizia cache authentication ──
-  step 9 "Pulizia secret cached in openshift-authentication"
+  # ── STEP 9: Clean authentication cache ──
+  step 9 "Cleaning cached secret in openshift-authentication"
 
   if $KUBECTL get secret v4-0-config-system-router-certs -n openshift-authentication &>/dev/null; then
     $KUBECTL delete secret v4-0-config-system-router-certs -n openshift-authentication
-    ok "Secret v4-0-config-system-router-certs eliminato"
+    ok "Secret v4-0-config-system-router-certs deleted"
   else
-    info "Secret non presente (verrà ricreato)"
+    info "Secret not present (it will be recreated)"
   fi
 
-  # ── STEP 10: Riavvia authentication ──
-  step 10 "Riavvio authentication-operator e pod oauth"
+  # ── STEP 10: Restart authentication ──
+  step 10 "Restarting authentication-operator and oauth pods"
 
   if [[ "$FIX_IMAGEPULL" == true ]]; then
-    info "Applico patch imagePullPolicy=IfNotPresent su authentication-operator..."
+    info "Applying imagePullPolicy=IfNotPresent patch to authentication-operator..."
     $KUBECTL patch deployment authentication-operator -n openshift-authentication-operator \
       --type=json \
       -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' 2>/dev/null || true
   fi
 
   $KUBECTL delete pods --all -n openshift-authentication-operator 2>/dev/null || true
-  info "Attendo che l'authentication-operator sia Running..."
+  info "Waiting for authentication-operator to be Running..."
 
   for i in $(seq 1 60); do
     READY=$($KUBECTL get pods -n openshift-authentication-operator \
@@ -619,7 +619,7 @@ if [[ "$PLATFORM" == "ocp" ]]; then
     POD_STATUS=$($KUBECTL get pods -n openshift-authentication-operator \
       -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
     if [[ "$POD_STATUS" == "ImagePullBackOff" || "$POD_STATUS" == "ErrImagePull" ]]; then
-      warn "ImagePullBackOff rilevato — applico patch IfNotPresent"
+      warn "ImagePullBackOff detected — applying IfNotPresent patch"
       $KUBECTL patch deployment authentication-operator -n openshift-authentication-operator \
         --type=json \
         -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' 2>/dev/null || true
@@ -629,10 +629,10 @@ if [[ "$PLATFORM" == "ocp" ]]; then
   done
   echo ""
 
-  info "Riavvio pod oauth..."
+  info "Restarting oauth pods..."
   $KUBECTL delete pods --all -n openshift-authentication 2>/dev/null || true
 
-  info "Attendo che i pod oauth siano pronti (max 120s)..."
+  info "Waiting for oauth pods to be ready (max 120s)..."
   for i in $(seq 1 40); do
     RUNNING=$($KUBECTL get pods -n openshift-authentication --no-headers 2>/dev/null | grep -c "Running" || echo 0)
     TOTAL=$($KUBECTL get pods -n openshift-authentication --no-headers 2>/dev/null | wc -l | tr -d ' ')
@@ -645,14 +645,14 @@ if [[ "$PLATFORM" == "ocp" ]]; then
   done
   echo ""
 
-  # ── STEP 11: Verifica finale OCP ──
-  step 11 "Verifica finale"
+  # ── STEP 11: Final OCP verification ──
+  step 11 "Final verification"
 
-  info "Attendo 60 secondi per la riconciliazione degli operator..."
+  info "Waiting 60 seconds for operator reconciliation..."
   sleep 60
 
   divider
-  info "Stato ClusterOperators:"
+  info "ClusterOperators status:"
   divider
 
   ALL_OK=true
@@ -665,26 +665,26 @@ if [[ "$PLATFORM" == "ocp" ]]; then
       ok "$OP: Available=$AVAILABLE, Degraded=$DEGRADED ✅"
     else
       warn "$OP: Available=$AVAILABLE, Degraded=$DEGRADED"
-      [[ -n "$MSG" ]] && echo "     Messaggio: ${MSG:0:200}"
+      [[ -n "$MSG" ]] && echo "     Message: ${MSG:0:200}"
       ALL_OK=false
     fi
   done
 
   divider
-  info "Certificato servito dal router:"
+  info "Certificate served by the router:"
   OAUTH_HOST=$($KUBECTL get route oauth-openshift -n openshift-authentication -o jsonpath='{.spec.host}' 2>/dev/null || echo "oauth-openshift.$APPS_DOMAIN")
   echo | openssl s_client -connect "$OAUTH_HOST":443 -servername "$OAUTH_HOST" 2>/dev/null | \
-    openssl x509 -noout -dates -subject 2>/dev/null || warn "Impossibile verificare via TLS"
+    openssl x509 -noout -dates -subject 2>/dev/null || warn "Unable to verify via TLS"
 
-fi  # fine OCP
+fi  # end OCP
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FLUSSO RKE2
+#  RKE2 FLOW
 # ═══════════════════════════════════════════════════════════════════════════════
 if [[ "$PLATFORM" == "rke2" ]]; then
 
-  # Rileva ambiente RKE2
+  # Detect RKE2 environment
   IS_SERVER_NODE=false
   RKE2_TLS_DIR="$RKE2_DATA_DIR/server/tls"
   [[ -d "$RKE2_TLS_DIR" ]] && IS_SERVER_NODE=true
@@ -697,14 +697,14 @@ if [[ "$PLATFORM" == "rke2" ]]; then
   fi
 
   if [[ "$IS_SERVER_NODE" == true ]]; then
-    ok "Nodo server RKE2 rilevato: $RKE2_TLS_DIR"
+    ok "RKE2 server node detected: $RKE2_TLS_DIR"
   else
-    warn "Non siamo su un nodo server RKE2 — operazioni control plane non disponibili"
+    warn "This is not an RKE2 server node — control plane operations are not available"
   fi
-  [[ -n "$RKE2_SERVICE" ]] && ok "Servizio: $RKE2_SERVICE"
+  [[ -n "$RKE2_SERVICE" ]] && ok "Service: $RKE2_SERVICE"
 
-  # ── STEP 1: Verifica certificati control plane ──
-  step 1 "Verifica certificati control plane"
+  # ── STEP 1: Check control plane certificates ──
+  step 1 "Checking control plane certificates"
 
   EXPIRED_CERTS=()
   EXPIRING_CERTS=()
@@ -741,20 +741,20 @@ if [[ "$PLATFORM" == "rke2" ]]; then
 
     divider
     if [[ ${#EXPIRED_CERTS[@]} -gt 0 ]]; then
-      err "Certificati SCADUTI: ${EXPIRED_CERTS[*]}"
+      err "EXPIRED certificates: ${EXPIRED_CERTS[*]}"
     fi
     if [[ ${#EXPIRING_CERTS[@]} -gt 0 ]]; then
-      warn "In scadenza (<${WARN_DAYS}gg): ${EXPIRING_CERTS[*]}"
+      warn "Expiring soon (<${WARN_DAYS} days): ${EXPIRING_CERTS[*]}"
     fi
     if [[ ${#EXPIRED_CERTS[@]} -eq 0 && ${#EXPIRING_CERTS[@]} -eq 0 ]]; then
-      ok "Tutti i certificati del control plane sono validi"
+      ok "All control plane certificates are valid"
     fi
   else
-    info "Skipping — non siamo su un nodo server RKE2"
+    info "Skipping — this is not an RKE2 server node"
   fi
 
-  # ── STEP 2: Verifica certificati ingress ──
-  step 2 "Verifica certificati ingress"
+  # ── STEP 2: Check ingress certificates ──
+  step 2 "Checking ingress certificates"
 
   INGRESS_TYPE="unknown"
   INGRESS_NS=""
@@ -771,7 +771,7 @@ if [[ "$PLATFORM" == "rke2" ]]; then
     fi
     [[ "$INGRESS_TYPE" != "unknown" ]] && ok "Ingress controller: $INGRESS_TYPE ($INGRESS_NS)"
 
-    info "Ricerca secret TLS..."
+    info "Searching TLS secrets..."
     TLS_SECRETS=$($KUBECTL get secrets -A -o json 2>/dev/null | \
       jq -r '.items[] | select(.type=="kubernetes.io/tls") |
       "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null || echo "")
@@ -785,40 +785,40 @@ if [[ "$PLATFORM" == "rke2" ]]; then
         [[ $RET -eq 2 ]] && INGRESS_EXPIRED=true
       done <<< "$TLS_SECRETS"
     else
-      info "Nessun secret TLS trovato"
+      info "No TLS secrets found"
     fi
   fi
 
-  # ── check-only: termina ──
+  # ── check-only: exit ──
   if [[ "$CHECK_ONLY" == true ]]; then
     divider
-    info "Modalità check-only — nessuna modifica applicata."
+    info "Check-only mode — no changes applied."
     if [[ ${#EXPIRED_CERTS[@]} -gt 0 || "$INGRESS_EXPIRED" == true ]]; then
-      echo -e "\nRiepilogo: ${RED}CERTIFICATI SCADUTI RILEVATI${NC}"
+      echo -e "\nSummary: ${RED}EXPIRED CERTIFICATES DETECTED${NC}"
     elif [[ ${#EXPIRING_CERTS[@]} -gt 0 ]]; then
-      echo -e "\nRiepilogo: ${YELLOW}CERTIFICATI IN SCADENZA${NC}"
+      echo -e "\nSummary: ${YELLOW}CERTIFICATES EXPIRING SOON${NC}"
     else
-      echo -e "\nRiepilogo: ${GREEN}TUTTI I CERTIFICATI VALIDI${NC}"
+      echo -e "\nSummary: ${GREEN}ALL CERTIFICATES VALID${NC}"
     fi
     echo ""
-    echo "Per applicare i fix:"
+    echo "To apply fixes:"
     echo "  $0 --platform=rke2 --fix-controlplane"
     echo "  $0 --platform=rke2 --fix-ingress --ingress-domain=apps.example.com"
     echo "  $0 --platform=rke2 --fix-all"
     exit 0
   fi
 
-  # ── auto mode: procedi solo se necessario ──
+  # ── auto mode: proceed only if needed ──
   if [[ "$AUTO_MODE" == true ]]; then
     NEEDS_RENEWAL=false
 
-    # Controlla control plane: scaduti o in scadenza entro la soglia
+    # Check control plane: expired or expiring within the threshold
     if [[ "$IS_SERVER_NODE" == true && "$FIX_CONTROLPLANE" == true ]]; then
       if [[ ${#EXPIRED_CERTS[@]} -gt 0 ]]; then
         NEEDS_RENEWAL=true
-        warn "Modalità auto: ${#EXPIRED_CERTS[@]} certificati control plane SCADUTI — procedo al rinnovo"
+        warn "Auto mode: ${#EXPIRED_CERTS[@]} control plane certificates EXPIRED — proceeding with renewal"
       else
-        # Verifica se qualcuno scade entro AUTO_THRESHOLD_DAYS
+        # Check whether any certificate expires within AUTO_THRESHOLD_DAYS
         for CERT_NAME in $(echo "${!CP_CERTS[@]}" | tr ' ' '\n' | sort); do
           CERT_PATH="${CP_CERTS[$CERT_NAME]}"
           [[ ! -f "$CERT_PATH" ]] && continue
@@ -828,18 +828,18 @@ if [[ "$PLATFORM" == "rke2" ]]; then
           DAYS_LEFT=$(( (EXPIRY_EPOCH - $(date +%s)) / 86400 ))
           if (( DAYS_LEFT <= AUTO_THRESHOLD_DAYS )); then
             NEEDS_RENEWAL=true
-            warn "Modalità auto: $CERT_NAME scade tra $DAYS_LEFT giorni (soglia: ${AUTO_THRESHOLD_DAYS}gg) — procedo al rinnovo"
+            warn "Auto mode: $CERT_NAME expires in $DAYS_LEFT days (threshold: ${AUTO_THRESHOLD_DAYS} days) — proceeding with renewal"
             break
           fi
         done
       fi
     fi
 
-    # Controlla ingress
+    # Check ingress
     if [[ "$FIX_INGRESS" == true ]]; then
       if [[ "$INGRESS_EXPIRED" == true ]]; then
         NEEDS_RENEWAL=true
-        warn "Modalità auto: certificati ingress SCADUTI — procedo al rinnovo"
+        warn "Auto mode: ingress certificates EXPIRED — proceeding with renewal"
       elif [[ -n "$TLS_SECRETS" ]]; then
         while IFS='/' read -r NS SECRET; do
           CERT_DATA=$($KUBECTL get secret "$SECRET" -n "$NS" -o jsonpath='{.data.tls\.crt}' 2>/dev/null || echo "")
@@ -850,7 +850,7 @@ if [[ "$PLATFORM" == "rke2" ]]; then
           DAYS_LEFT=$(( (EXPIRY_EPOCH - $(date +%s)) / 86400 ))
           if (( DAYS_LEFT <= AUTO_THRESHOLD_DAYS )); then
             NEEDS_RENEWAL=true
-            warn "Modalità auto: secret $NS/$SECRET scade tra $DAYS_LEFT giorni (soglia: ${AUTO_THRESHOLD_DAYS}gg) — procedo al rinnovo"
+            warn "Auto mode: secret $NS/$SECRET expires in $DAYS_LEFT days (threshold: ${AUTO_THRESHOLD_DAYS} days) — proceeding with renewal"
             break
           fi
         done <<< "$TLS_SECRETS"
@@ -858,19 +858,19 @@ if [[ "$PLATFORM" == "rke2" ]]; then
     fi
 
     if [[ "$NEEDS_RENEWAL" == false ]]; then
-      ok "Modalità auto: nessun certificato scade entro ${AUTO_THRESHOLD_DAYS} giorni — nessun intervento necessario"
+      ok "Auto mode: no certificate expires within ${AUTO_THRESHOLD_DAYS} days — no action needed"
       exit 0
     fi
   fi
 
-  # Verifica che sia stata specificata un'azione
+  # Check that an action was specified
   if [[ "$FIX_CONTROLPLANE" == false && "$FIX_INGRESS" == false ]]; then
-    warn "Nessuna azione specificata. Usa --fix-controlplane, --fix-ingress, o --fix-all"
+    warn "No action specified. Use --fix-controlplane, --fix-ingress, or --fix-all"
     exit 0
   fi
 
   # ── STEP 3: Backup ──
-  step 3 "Backup certificati"
+  step 3 "Backing up certificates"
 
   BACKUP_DIR="/root/rke2-certs-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -880,7 +880,7 @@ if [[ "$PLATFORM" == "rke2" ]]; then
     for KC in /etc/rancher/rke2/rke2.yaml; do
       [[ -f "$KC" ]] && cp "$KC" "$BACKUP_DIR/" 2>/dev/null || true
     done
-    ok "Backup control plane: $BACKUP_DIR"
+    ok "Control plane backup: $BACKUP_DIR"
   fi
 
   if [[ "$FIX_INGRESS" == true && "$CLUSTER_ACCESS" == true && -n "$TLS_SECRETS" ]]; then
@@ -888,59 +888,59 @@ if [[ "$PLATFORM" == "rke2" ]]; then
     while IFS='/' read -r NS SECRET; do
       $KUBECTL get secret "$SECRET" -n "$NS" -o yaml > "$BACKUP_DIR/ingress-secrets/${NS}_${SECRET}.yaml" 2>/dev/null || true
     done <<< "$TLS_SECRETS"
-    ok "Backup ingress secrets: $BACKUP_DIR/ingress-secrets/"
+    ok "Ingress secrets backup: $BACKUP_DIR/ingress-secrets/"
   fi
 
   # ── STEP 4: Fix control plane ──
   if [[ "$FIX_CONTROLPLANE" == true ]]; then
-    step 4 "Rigenerazione certificati control plane"
+    step 4 "Regenerating control plane certificates"
 
     if [[ "$IS_SERVER_NODE" == false ]]; then
-      err "Non siamo su un nodo server RKE2 — impossibile rigenerare il control plane"
+      err "This is not an RKE2 server node — unable to regenerate the control plane"
       exit 1
     fi
     if [[ "$RKE2_SERVICE" != "rke2-server" ]]; then
-      err "Servizio rke2-server non trovato"
+      err "rke2-server service not found"
       exit 1
     fi
 
     if [[ ${#EXPIRED_CERTS[@]} -gt 0 ]]; then
-      info "Rimozione certificati scaduti..."
+      info "Removing expired certificates..."
       for CERT_NAME in "${EXPIRED_CERTS[@]}"; do
         CERT_PATH="${CP_CERTS[$CERT_NAME]:-}"
         KEY_PATH="${CERT_PATH%.crt}.key"
         if [[ -n "$CERT_PATH" && -f "$CERT_PATH" ]]; then
-          info "Rimuovo: $CERT_NAME"
+          info "Removing: $CERT_NAME"
           rm -f "$CERT_PATH"
           [[ -f "$KEY_PATH" ]] && rm -f "$KEY_PATH"
         fi
       done
     else
-      info "Forzo la rigenerazione di tutti i certificati non-CA..."
+      info "Forcing regeneration of all non-CA certificates..."
       for CERT_NAME in "${!CP_CERTS[@]}"; do
         CERT_PATH="${CP_CERTS[$CERT_NAME]}"
         if [[ "$CERT_NAME" == *"-ca"* ]]; then
-          info "Mantengo CA: $CERT_NAME"
+          info "Keeping CA: $CERT_NAME"
           continue
         fi
         if [[ -f "$CERT_PATH" ]]; then
-          info "Rimuovo: $CERT_NAME"
+          info "Removing: $CERT_NAME"
           rm -f "$CERT_PATH"
           KEY_PATH="${CERT_PATH%.crt}.key"
           [[ -f "$KEY_PATH" ]] && rm -f "$KEY_PATH"
         fi
       done
     fi
-    ok "Certificati rimossi"
+    ok "Certificates removed"
 
-    info "Riavvio rke2-server..."
-    warn "Il cluster sarà temporaneamente non disponibile"
+    info "Restarting rke2-server..."
+    warn "The cluster will be temporarily unavailable"
     systemctl restart rke2-server
 
-    info "Attendo il riavvio (max 180s)..."
+    info "Waiting for restart (max 180s)..."
     for i in $(seq 1 60); do
       if systemctl is-active rke2-server &>/dev/null && $KUBECTL get nodes &>/dev/null 2>&1; then
-        ok "rke2-server attivo e apiserver raggiungibile"
+        ok "rke2-server active and apiserver reachable"
         break
       fi
       echo -n "."
@@ -949,12 +949,12 @@ if [[ "$PLATFORM" == "rke2" ]]; then
     echo ""
 
     if ! systemctl is-active rke2-server &>/dev/null; then
-      err "rke2-server non ripartito — controlla: journalctl -u rke2-server -f"
-      err "Backup in: $BACKUP_DIR"
+      err "rke2-server did not restart — check: journalctl -u rke2-server -f"
+      err "Backup at: $BACKUP_DIR"
       exit 1
     fi
 
-    info "Verifica nuovi certificati..."
+    info "Checking new certificates..."
     NEW_EXPIRED=0
     for CERT_NAME in $(echo "${!CP_CERTS[@]}" | tr ' ' '\n' | sort); do
       CERT_PATH="${CP_CERTS[$CERT_NAME]}"
@@ -966,9 +966,9 @@ if [[ "$PLATFORM" == "rke2" ]]; then
     done
 
     if [[ $NEW_EXPIRED -eq 0 ]]; then
-      ok "Tutti i certificati del control plane rigenerati con successo"
+      ok "All control plane certificates regenerated successfully"
     else
-      err "$NEW_EXPIRED certificati ancora scaduti"
+      err "$NEW_EXPIRED certificates still expired"
     fi
   fi
 
@@ -976,24 +976,24 @@ if [[ "$PLATFORM" == "rke2" ]]; then
   UPDATED_SECRETS=0
   if [[ "$FIX_INGRESS" == true ]]; then
     STEP_N=5; [[ "$FIX_CONTROLPLANE" == false ]] && STEP_N=4
-    step $STEP_N "Rigenerazione certificato ingress"
+    step $STEP_N "Regenerating ingress certificate"
 
     if [[ "$CLUSTER_ACCESS" == false ]]; then
-      err "Accesso al cluster non disponibile"
+      err "Cluster access is not available"
       exit 1
     fi
 
-    # Rileva dominio
+    # Detect domain
     if [[ -z "$INGRESS_DOMAIN" ]]; then
-      info "Rilevamento automatico dominio ingress..."
+      info "Auto-detecting ingress domain..."
       DETECTED=$($KUBECTL get ingress -A -o json 2>/dev/null | \
         jq -r '.items[].spec.rules[]?.host // empty' 2>/dev/null | \
         sed 's/^[^.]*\.//' | sort -u | head -1 || echo "")
-      [[ -n "$DETECTED" ]] && INGRESS_DOMAIN="$DETECTED" && info "Dominio rilevato: $INGRESS_DOMAIN"
+      [[ -n "$DETECTED" ]] && INGRESS_DOMAIN="$DETECTED" && info "Detected domain: $INGRESS_DOMAIN"
     fi
 
     if [[ -z "$INGRESS_DOMAIN" ]]; then
-      err "Dominio non specificato. Usa --ingress-domain=apps.example.com"
+      err "Domain not specified. Use --ingress-domain=apps.example.com"
       exit 1
     fi
 
@@ -1009,12 +1009,12 @@ if [[ "$PLATFORM" == "rke2" ]]; then
         NOW_EPOCH=$(date +%s)
 
         if (( EXPIRY_EPOCH < NOW_EPOCH )); then
-          info "Aggiornamento: $NS/$SECRET"
+          info "Updating: $NS/$SECRET"
           $KUBECTL create secret tls "$SECRET" \
             --cert="$TMPDIR/wildcard.crt" --key="$TMPDIR/wildcard.key" \
             -n "$NS" --dry-run=client -o yaml | $KUBECTL replace -f - 2>/dev/null && \
-            ok "$NS/$SECRET aggiornato" && ((UPDATED_SECRETS++)) || \
-            warn "Impossibile aggiornare $NS/$SECRET"
+            ok "$NS/$SECRET updated" && ((UPDATED_SECRETS++)) || \
+            warn "Unable to update $NS/$SECRET"
         fi
       done <<< "$TLS_SECRETS"
     fi
@@ -1024,10 +1024,10 @@ if [[ "$PLATFORM" == "rke2" ]]; then
       $KUBECTL create secret tls default-tls-cert \
         --cert="$TMPDIR/wildcard.crt" --key="$TMPDIR/wildcard.key" \
         -n "$DEFAULT_NS" --dry-run=client -o yaml | $KUBECTL apply -f -
-      ok "Secret $DEFAULT_NS/default-tls-cert creato"
+      ok "Secret $DEFAULT_NS/default-tls-cert created"
     fi
 
-    info "Riavvio ingress controller..."
+    info "Restarting ingress controller..."
     if [[ "$INGRESS_TYPE" == "nginx" ]]; then
       $KUBECTL rollout restart deployment/rke2-ingress-nginx-controller -n "$INGRESS_NS" 2>/dev/null || \
       $KUBECTL rollout restart deployment/ingress-nginx-controller -n "$INGRESS_NS" 2>/dev/null || \
@@ -1035,28 +1035,28 @@ if [[ "$PLATFORM" == "rke2" ]]; then
     elif [[ "$INGRESS_TYPE" == "traefik" ]]; then
       $KUBECTL rollout restart deployment/traefik -n "$INGRESS_NS" 2>/dev/null || true
     else
-      warn "Ingress controller sconosciuto — riavvia manualmente"
+      warn "Unknown ingress controller — restart it manually"
     fi
-    ok "Ingress controller riavviato"
+    ok "Ingress controller restarted"
     rm -rf "$TMPDIR"
   fi
 
-  # ── Verifica finale RKE2 ──
+  # ── Final RKE2 verification ──
   FINAL_N=6
   [[ "$FIX_CONTROLPLANE" == false || "$FIX_INGRESS" == false ]] && FINAL_N=5
-  step $FINAL_N "Verifica finale"
+  step $FINAL_N "Final verification"
 
   divider
   ALL_OK=true
 
   if [[ "$CLUSTER_ACCESS" == true ]]; then
-    info "Stato nodi:"
+    info "Node status:"
     $KUBECTL get nodes -o wide 2>/dev/null || true
     echo ""
   fi
 
   if [[ -n "$RKE2_SERVICE" ]]; then
-    systemctl is-active "$RKE2_SERVICE" &>/dev/null && ok "$RKE2_SERVICE attivo" || { warn "$RKE2_SERVICE non attivo"; ALL_OK=false; }
+    systemctl is-active "$RKE2_SERVICE" &>/dev/null && ok "$RKE2_SERVICE active" || { warn "$RKE2_SERVICE not active"; ALL_OK=false; }
   fi
 
   if [[ "$FIX_CONTROLPLANE" == true && "$IS_SERVER_NODE" == true ]]; then
@@ -1067,38 +1067,38 @@ if [[ "$PLATFORM" == "rke2" ]]; then
       (( EXPIRY_EPOCH < $(date +%s) )) && ((CP_EXP++))
     done
     if [[ $CP_EXP -eq 0 ]]; then
-      ok "Control plane: tutti i certificati validi ✅"
+      ok "Control plane: all certificates valid ✅"
     else
-      err "Control plane: $CP_EXP certificati ancora scaduti ❌"
+      err "Control plane: $CP_EXP certificates still expired ❌"
       ALL_OK=false
     fi
   fi
 
   if [[ "$FIX_INGRESS" == true ]]; then
-    info "Ingress: $UPDATED_SECRETS secret aggiornati"
+    info "Ingress: $UPDATED_SECRETS secrets updated"
   fi
 
-fi  # fine RKE2
+fi  # end RKE2
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  RIEPILOGO FINALE
+#  FINAL SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 divider
 if [[ "${ALL_OK:-true}" == true ]]; then
   echo -e "${GREEN}╔═══════════════════════════════════════════════════╗${NC}"
-  echo -e "${GREEN}║  ✅ OPERAZIONE COMPLETATA CON SUCCESSO!           ║${NC}"
+  echo -e "${GREEN}║  ✅ OPERATION COMPLETED SUCCESSFULLY!             ║${NC}"
   echo -e "${GREEN}╚═══════════════════════════════════════════════════╝${NC}"
 else
   echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${YELLOW}║  ⚠️  Completato con avvertimenti — verifica lo stato.         ║${NC}"
+  echo -e "${YELLOW}║  ⚠️  Completed with warnings — verify the status.             ║${NC}"
   if [[ "$PLATFORM" == "ocp" ]]; then
-    echo -e "${YELLOW}║  Comando: oc get co                                          ║${NC}"
+    echo -e "${YELLOW}║  Command: oc get co                                          ║${NC}"
   else
-    echo -e "${YELLOW}║  Comando: journalctl -u rke2-server -f                       ║${NC}"
+    echo -e "${YELLOW}║  Command: journalctl -u rke2-server -f                       ║${NC}"
   fi
   echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
 fi
 
 [[ -n "${BACKUP_DIR:-}" && -d "${BACKUP_DIR:-}" ]] && info "Backup: $BACKUP_DIR"
-info "Script completato — $(date)"
+info "Script completed — $(date)"
