@@ -73,6 +73,23 @@ Nothing on the cluster changes: the new certificates are signed by the existing 
 | `--certs` | – | certificate renewal only |
 | `--crt-ttl` | `8760h` | validity of the new Talos client certificate |
 | `--secrets` | `~/TalosLinux/ENV/secrets.yaml` | used only if the Talos certificate already expired |
+| `--min-days N` | - | renew only when a certificate expires within N days |
+
+### Automatic renewal
+
+`systemd/` holds a templated service and timer: every day at 10:00 they run `kupdate ENV --certs --yes --min-days 30`, which does nothing until a certificate is 30 days from expiry.
+
+```bash
+U=$USER
+sed "s/USER/$U/g" systemd/kupdate-certs@.service | sudo tee /etc/systemd/system/kupdate-certs@.service >/dev/null
+sudo cp systemd/kupdate-certs@.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now kupdate-certs@dev.timer kupdate-certs@prod.timer
+sudo systemctl start kupdate-certs@dev.service    # test: logs "nothing to do" while the certificates are valid
+journalctl -u 'kupdate-certs@*'
+```
+
+Failures (cluster unreachable, verification failed) leave the old files in place and show up as a failed unit: `systemctl --failed`.
 
 ## Before the first real run
 

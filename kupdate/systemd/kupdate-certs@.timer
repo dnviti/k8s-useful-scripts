@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily check of the Talos/Kubernetes admin certificates of %i
+
+[Timer]
+OnCalendar=*-*-* 10:00
+RandomizedDelaySec=0
+Persistent=true
+
+[Install]
+WantedBy=timers.target

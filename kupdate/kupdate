@@ -786,6 +786,9 @@ def renew_certs(c, args, env):
     log(f"kubeconfig {c.kubeconfig}: user {kuser}, client certificate expires in {kube_days} days")
     if others:
         log(f"kubeconfig also holds {', '.join(others)}: not renewed here, and not checked by upgrades of {env}", "WARN")
+    if args.min_days is not None and min(talos_days, kube_days) > args.min_days:
+        log(f"both certificates are valid for more than {args.min_days} days: nothing to do")
+        return 0
     if talos_days > 0:
         method = f"talosctl config new (signed by the cluster through the Talos API), validity {args.crt_ttl}"
     else:
@@ -1176,6 +1179,8 @@ def main():
                     help="only renew the admin client certificates of talosconfig and kubeconfig (no upgrade); "
                          "with --plan only shows their expiry")
     ap.add_argument("--crt-ttl", default="8760h", help="validity of the new Talos client certificate (8760h)")
+    ap.add_argument("--min-days", type=float, help="with --certs: renew only when a certificate expires within N days "
+                    "(for a daily timer, see systemd/)")
     ap.add_argument("--secrets", help="secrets.yaml used when the Talos client certificate already expired "
                                       "(default ~/TalosLinux/{env}/secrets.yaml, env KUPDATE_SECRETS)")
     ap.add_argument("--yes", action="store_true", help="do not ask for confirmation")

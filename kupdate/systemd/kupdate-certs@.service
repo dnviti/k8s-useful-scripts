@@ -1,0 +1,12 @@
+[Unit]
+Description=kupdate: renew the Talos/Kubernetes admin client certificates of %i when they expire within 30 days
+Documentation=https://github.com/dnviti/k8s-useful-scripts/tree/master/kupdate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# the user that owns ~/TalosLinux/<env>/talosconfig and ~/.kube/config-<env>
+User=USER
+Environment=HOME=/home/USER
+ExecStart=/home/USER/.local/bin/kupdate %i --certs --yes --min-days 30
