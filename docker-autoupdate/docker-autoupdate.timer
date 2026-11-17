@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly nightly docker compose update
+
+[Timer]
+# Set by install.sh (--day / --time). Persistent=false: a run missed while the
+# host was off is NOT caught up during the day.
+OnCalendar=Sun *-*-* 03:30:00
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

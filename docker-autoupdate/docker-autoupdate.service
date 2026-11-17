@@ -1,0 +1,14 @@
+[Unit]
+Description=Update docker compose services and prune old images
+Documentation=https://github.com/dnviti/k8s-useful-scripts/tree/master/docker-autoupdate
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=KEEP=2
+ExecStart=/usr/local/sbin/docker-autoupdate.sh
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
