@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+"""kupdate - rolling Talos Linux upgrade, one release at a time, with live checks.
+
+Upgrades every node of a Talos cluster through the latest patch of each
+intermediate minor release (e.g. 1.8.0 -> 1.8.4 -> 1.9.6 -> ...), one node at a
+time: control planes first, then workers. Before, during and after every node
+it checks that the cluster and the published endpoints keep working, and it
+stops at the first problem.
+
+Usage:
+  kupdate ENV --plan            read-only: checks, upgrade path, disruption report
+  kupdate ENV [options]         run the upgrade (asks to type ENV to confirm)
+
+ENV selects the configs (patterns overridable with environment variables):
+  KUPDATE_KUBECONFIG   default ~/.kube/config-{env}       (or --kubeconfig FILE)
+  KUPDATE_TALOSCONFIG  default ~/TalosLinux/{env}/talosconfig  (or --talosconfig FILE)
+The starting version is read from the nodes, the path (latest patch of every
+release line) and the Kubernetes compatibility from GitHub and the official
+Talos support matrix: it works for any Talos version, no version is hard-coded.
+Neither ~/.kube/config nor $TALOSCONFIG are used or modified.
+
+Stops (exit 1) when:
+  - a node is not Ready, etcd is not healthy, a Longhorn volume is degraded/faulted,
+    a Deployment/StatefulSet/DaemonSet that was healthy at start is not ready
+    again within the timeouts, `talosctl health` fails;
+  - an endpoint that answered at start fails --fail-after checks in a row
+    (connection error, timeout or HTTP 5xx);
+  - draining a node would stop every ready replica of a workload (a single
+    replica, or all replicas on that node): that would be downtime. Use
+    --allow-disruption to accept it (endpoints must then recover in time);
+  - the next Talos release does not support the running Kubernetes version
+    (use --with-k8s to upgrade Kubernetes one minor at a time when needed);
+  - a node was cordoned outside kupdate, or an upgraded node lost a system
+    extension, its schematic or an active extraKernelArgs entry.
+Endpoints (Ingress hosts plus the --endpoints file) are probed every --interval
+seconds, 4 at a time, without following redirects (3xx counts as an answer).
+They should resolve to internal addresses: do not monitor URLs behind a WAF or
+a rate-limited proxy.
+A node upgrade already started is never interrupted: on an error, Ctrl-C,
+SIGTERM or SIGHUP kupdate waits for it to finish, then stops. Run it inside
+tmux or screen. Nodes cordoned by kupdate carry the annotation
+kupdate/cordoned=true and the next run uncordons them once Ready; nodes at or
+above the target version are skipped, so after fixing the cause you can simply
+run kupdate again.
+"""
+
+import argparse
+import base64
+import concurrent.futures
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import signal
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local", "state", "kupdate")
+CACHE_DIR = os.path.join(HOME, ".local", "share", "kupdate")
+GH_API = "https://api.github.com/repos/siderolabs/talos/releases?per_page=100&page={}"
+MATRIX_URL = "https://docs.siderolabs.com/talos/v{line}/getting-started/support-matrix.md"
+K8S_STABLE = "https://dl.k8s.io/release/stable-1.{minor}.txt"
+VANILLA_SCHEMATIC = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
+CORDON_MARK = "kupdate/cordoned"  # node annotation: cordoned by kupdate, uncordoned only by kupdate
+SKIP_OWNERS = {"DaemonSet", "Node", "InstanceManager", "Job"}  # per-node or non-serving pods
+
+ABORT = threading.Event()
+ABORT_REASON = []
+LOG = None
+
+
+class Abort(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- output
+
+def log(msg="", level="INFO"):
+    line = f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {level:5} {msg}"
+    try:
+        print(line, flush=True)
+    except OSError:  # terminal gone (SIGHUP): keep logging to the file
+        pass
+    if LOG:
+        LOG.write(line + "\n")
+        LOG.flush()
+
+
+def stop(reason):
+    if not ABORT.is_set():
+        ABORT_REASON.append(reason)
+        ABORT.set()
+    raise Abort(reason)
+
+
+def checkpoint():
+    if ABORT.is_set():
+        raise Abort(ABORT_REASON[0] if ABORT_REASON else "aborted")
+
+
+def on_signal(sig, _frame):
+    """SIGINT/SIGTERM/SIGHUP: abort through the normal path. No buffered I/O here (not reentrant)."""
+    name = signal.Signals(sig).name
+    if not ABORT.is_set():
+        ABORT_REASON.append(f"{name} received")
+        ABORT.set()
+    try:
+        os.write(2, f"\n{name} received: stopping at the next safe point "
+                    "(a running node upgrade is never interrupted)\n".encode())
+    except OSError:
+        pass
+
+
+def safe(fn, *a):
+    """(fn(*a), None), or (None, error) when a kubectl/talosctl call fails or times out."""
+    try:
+        return fn(*a), None
+    except (RuntimeError, subprocess.TimeoutExpired, ValueError) as e:
+        return None, str(e)[:200]
+
+
+def retry(fn, *a, what, timeout=300):
+    """fn(*a), retried on transient failures (e.g. the API server of a rebooting control plane)."""
+    deadline = time.time() + timeout
+    while True:
+        res, err = safe(fn, *a)
+        if err is None:
+            return res
+        if time.time() > deadline:
+            stop(f"{what} failing for {timeout // 60} min: {err}")
+        log(f"{what} failed, retrying: {err}", "WARN")
+        time.sleep(15)
+
+
+# ---------------------------------------------------------------- versions
+
+def vt(v):
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", v.strip())
+    if not m:
+        raise ValueError(f"bad version {v!r}")
+    return tuple(int(x) for x in m.groups())
+
+
+def vs(t):
+    return "v%d.%d.%d" % t
+
+
+def http_get(url, timeout=20, headers=None):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "kupdate"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read()
+
+
+def talos_releases():
+    """Latest stable patch of every Talos release line: {(major, minor): (major, minor, patch)}."""
+    tags = []
+    for page in range(1, 30):
+        _, body = http_get(GH_API.format(page))
+        rel = json.loads(body)
+        if not rel:
+            break
+        for r in rel:
+            if r.get("draft") or r.get("prerelease"):
+                continue
+            try:
+                tags.append(vt(r["tag_name"]))
+            except ValueError:
+                pass
+    latest = {}
+    for t in tags:
+        if t[:2] not in latest or t > latest[t[:2]]:
+            latest[t[:2]] = t
+    return latest
+
+
+_matrix_cache = {}
+
+
+def k8s_support(line):
+    """Kubernetes 1.x minors supported by the Talos release line (major, minor), from the official support matrix."""
+    if line in _matrix_cache:
+        return _matrix_cache[line]
+    name = "%d.%d" % line
+    _, body = http_get(MATRIX_URL.format(line=name))
+    text = body.decode("utf-8", "replace")
+    head = next((l for l in text.splitlines() if l.startswith("| Talos Version")), None)
+    row = next((l for l in text.splitlines() if l.startswith("| Kubernetes")), None)
+    if not head or not row:
+        raise RuntimeError(f"cannot parse the support matrix of Talos {name}")
+    cols = [c.strip() for c in head.strip("|").split("|")][1:]
+    vals = [c.strip() for c in row.strip("|").split("|")][1:]
+    col = next((i for i, c in enumerate(cols) if c == name), None)
+    if col is None:
+        raise RuntimeError(f"Talos {name} missing from its support matrix")
+    minors = {int(x.split(".")[1]) for x in re.findall(r"\b1\.\d+", vals[col])}
+    _matrix_cache[line] = minors
+    return minors
+
+
+def k8s_latest_patch(minor):
+    _, body = http_get(K8S_STABLE.format(minor=minor))
+    return vt(body.decode().strip())
+
+
+# ---------------------------------------------------------------- commands
+
+class Cluster:
+    def __init__(self, env, kubeconfig, talosconfig):
+        self.env = env
+        self.kubeconfig = kubeconfig
+        self.talosconfig = talosconfig
+        self.talosctl_default = "talosctl"
+        self.longhorn = False
+
+    def run(self, cmd, timeout=120, check=True, quiet=False):
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if check and p.returncode != 0:
+            raise RuntimeError(f"{' '.join(cmd[:6])}... failed: {p.stderr.strip()[:500]}")
+        return p
+
+    def kubectl(self, *args, timeout=120, check=True):
+        return self.run(["kubectl", "--kubeconfig", self.kubeconfig, *args], timeout=timeout, check=check)
+
+    def kjson(self, *args):
+        return json.loads(self.kubectl(*args, "-o", "json").stdout)
+
+    def talosctl(self, *args, endpoint, nodes, binary=None, timeout=120, check=True):
+        cmd = [binary or self.talosctl_default, "--talosconfig", self.talosconfig,
+               "-e", endpoint, "-n", ",".join(nodes) if isinstance(nodes, list) else nodes, *args]
+        return self.run(cmd, timeout=timeout, check=check)
+
+    # ------------------------------------------------ state
+    def nodes(self):
+        out = []
+        for n in self.kjson("get", "nodes")["items"]:
+            addr = next((a["address"] for a in n["status"]["addresses"] if a["type"] == "InternalIP"), None)
+            labels = n["metadata"].get("labels", {})
+            annotations = n["metadata"].get("annotations") or {}
+            cond = {c["type"]: c["status"] for c in n["status"].get("conditions", [])}
+            m = re.search(r"\((v[\d.]+)\)", n["status"]["nodeInfo"]["osImage"])
+            out.append({
+                "name": n["metadata"]["name"], "ip": addr,
+                "cp": "node-role.kubernetes.io/control-plane" in labels,
+                "ready": cond.get("Ready") == "True",
+                "unschedulable": bool(n["spec"].get("unschedulable")),
+                "kupdate": annotations.get(CORDON_MARK) == "true",
+                "talos": vt(m.group(1)) if m else None,
+                "kubelet": vt(n["status"]["nodeInfo"]["kubeletVersion"]),
+            })
+        out.sort(key=lambda x: (not x["cp"], x["name"]))
+        return out
+
+    def endpoint_for(self, node_ip, nodes):
+        for n in nodes:
+            if n["cp"] and n["ip"] != node_ip and n["ready"]:
+                return n["ip"]
+        stop("no other Ready control plane to use as talosctl endpoint")
+
+
+# ---------------------------------------------------------------- health checks
+
+def etcd_problems(c, nodes):
+    cps = [n["ip"] for n in nodes if n["cp"]]
+    ep = next((n["ip"] for n in nodes if n["cp"] and n["ready"]), cps[0])
+    p = c.talosctl("etcd", "status", endpoint=ep, nodes=cps, check=False, timeout=60)
+    probs = []
+    if p.returncode != 0:
+        return [f"etcd status failed: {p.stderr.strip()[:300]}"]
+    seen = set()
+    for line in p.stdout.splitlines()[1:]:
+        tok = line.split()
+        if not tok:
+            continue
+        seen.add(tok[0])
+        if tok[-1] not in ("true", "false"):
+            probs.append(f"etcd error on {tok[0]}: {line.strip()[-200:]}")
+        elif tok[-1] == "true":
+            probs.append(f"etcd member on {tok[0]} is a learner")
+    for ip in cps:
+        if ip not in seen:
+            probs.append(f"etcd status missing for {ip}")
+    m = c.talosctl("etcd", "members", endpoint=ep, nodes=cps[0], check=False, timeout=60)
+    members = [l for l in m.stdout.splitlines()[1:] if l.strip()]
+    if m.returncode != 0 or len(members) != len(cps):
+        probs.append(f"etcd members: expected {len(cps)}, got {len(members)}")
+    return probs
+
+
+def detect_longhorn(c):
+    p = c.kubectl("get", "crd", "volumes.longhorn.io", check=False)
+    if p.returncode == 0:
+        return True
+    if "NotFound" in p.stderr:
+        return False
+    raise RuntimeError(f"cannot check whether Longhorn is installed: {p.stderr.strip()[:200]}")
+
+
+def longhorn_problems(c):
+    if not c.longhorn:
+        return []
+    p = c.kubectl("-n", "longhorn-system", "get", "volumes.longhorn.io", "-o", "json", check=False)
+    if p.returncode != 0:
+        return [f"Longhorn query failed: {p.stderr.strip()[:200]}"]
+    probs = []
+    for v in json.loads(p.stdout)["items"]:
+        rob = v.get("status", {}).get("robustness", "")
+        if rob in ("degraded", "faulted"):
+            probs.append(f"Longhorn volume {v['metadata']['name']} {rob}")
+    return probs
+
+
+def unhealthy_workloads(c):
+    bad = set()
+    for kind in ("deployments", "statefulsets"):
+        for o in c.kjson("get", kind, "-A")["items"]:
+            want = o["spec"].get("replicas", 1)
+            ready = o.get("status", {}).get("readyReplicas", 0)
+            if want and ready < want:
+                bad.add(f"{kind[:-1]}/{o['metadata']['namespace']}/{o['metadata']['name']}")
+    for o in c.kjson("get", "daemonsets", "-A")["items"]:
+        st = o.get("status", {})
+        if st.get("numberReady", 0) < st.get("desiredNumberScheduled", 0):
+            bad.add(f"daemonset/{o['metadata']['namespace']}/{o['metadata']['name']}")
+    return bad
+
+
+def cluster_problems(c, baseline, check_etcd=True):
+    nodes = c.nodes()
+    probs = [f"node {n['name']} not Ready" for n in nodes if not n["ready"]]
+    if check_etcd:
+        probs += etcd_problems(c, nodes)
+    probs += longhorn_problems(c)
+    new_bad = unhealthy_workloads(c) - baseline["unhealthy"]
+    probs += [f"{w} not ready" for w in sorted(new_bad)]
+    return probs
+
+
+def wait_healthy(c, baseline, timeout, what):
+    """Wait for two clean checks about a minute apart (status can lag the node becoming Ready)."""
+    deadline = time.time() + timeout
+    last, clean = None, 0
+    while True:
+        checkpoint()
+        probs, err = safe(cluster_problems, c, baseline)
+        if err is not None:
+            probs = [f"check failed: {err}"]
+        if not probs:
+            clean += 1
+            if clean >= 2:
+                log(f"cluster healthy ({what})")
+                return
+            ABORT.wait(60)
+            continue
+        clean = 0
+        if probs != last:
+            log(f"waiting ({what}): " + "; ".join(probs[:6]) + (" ..." if len(probs) > 6 else ""))
+            last = probs
+        if time.time() > deadline:
+            stop(f"cluster not healthy after {timeout // 60} min ({what}): " + "; ".join(probs[:10]))
+        time.sleep(20)
+
+
+def talos_health(c, nodes, binary, wait=10):
+    cps = [n["ip"] for n in nodes if n["cp"]]
+    ws = [n["ip"] for n in nodes if not n["cp"]]
+    args = ["health", "--control-plane-nodes", ",".join(cps), "--wait-timeout", f"{wait}m"]
+    if ws:
+        args += ["--worker-nodes", ",".join(ws)]
+    ep = next(n["ip"] for n in nodes if n["cp"] and n["ready"])
+    p = c.talosctl(*args, endpoint=ep, nodes=ep, binary=binary, check=False, timeout=wait * 60 + 300)
+    if p.returncode != 0:
+        stop("talosctl health failed: " + (p.stderr or p.stdout).strip()[-600:])
+    log("talosctl health OK")
+
+
+# ---------------------------------------------------------------- endpoint monitor
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an answer: never follow redirects (e.g. to an external SSO)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class EndpointMonitor(threading.Thread):
+    def __init__(self, urls, interval, fail_after, timeout=10):
+        super().__init__(daemon=True)
+        self.urls = urls
+        self.interval = interval
+        self.fail_after = fail_after
+        self.timeout = timeout
+        self.fails = {u: 0 for u in urls}
+        self.grace = threading.Event()  # set while a disruption was explicitly allowed
+        self.running = threading.Event()
+        self.ctx = ssl.create_default_context()
+        self.ctx.check_hostname = False
+        self.ctx.verify_mode = ssl.CERT_NONE
+        self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.ctx), NoRedirect())
+
+    def probe(self, url):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "kupdate-monitor"})
+            with self.opener.open(req, timeout=self.timeout) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return 0
+
+    def round(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            return dict(zip(self.urls, ex.map(self.probe, self.urls)))
+
+    def run(self):
+        self.running.set()
+        while self.running.is_set() and not ABORT.is_set():
+            res = self.round()
+            for u, code in res.items():
+                if code == 0 or code >= 500:
+                    self.fails[u] += 1
+                    if self.fails[u] == 1 or self.fails[u] == self.fail_after:
+                        log(f"endpoint {u} -> {code or 'no answer'} ({self.fails[u]} in a row)", "WARN")
+                    if self.fails[u] >= self.fail_after and not self.grace.is_set():
+                        ABORT_REASON.append(f"endpoint {u} down ({self.fails[u]} checks in a row)")
+                        ABORT.set()
+                else:
+                    if self.fails[u]:
+                        log(f"endpoint {u} back ({code})")
+                    self.fails[u] = 0
+            time.sleep(self.interval)
+
+    def down(self):
+        return [u for u, f in self.fails.items() if f > 0]
+
+
+def discover_endpoints(c, extra_file):
+    urls = set()
+    for ing in c.kjson("get", "ingress", "-A")["items"]:
+        tls = {h for t in ing["spec"].get("tls", []) for h in t.get("hosts", [])}
+        for r in ing["spec"].get("rules", []):
+            h = r.get("host")
+            if h and "*" not in h:
+                urls.add(("https://" if h in tls else "http://") + h + "/")
+    if extra_file and os.path.exists(extra_file):
+        for line in open(extra_file):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                urls.add(line)
+    return sorted(urls)
+
+
+# ---------------------------------------------------------------- per-node analysis
+
+def selector_match(sel, labels):
+    for k, v in (sel.get("matchLabels") or {}).items():
+        if labels.get(k) != v:
+            return False
+    for e in sel.get("matchExpressions") or []:
+        k, op, vals = e["key"], e["operator"], e.get("values", [])
+        if op == "In" and labels.get(k) not in vals:
+            return False
+        if op == "NotIn" and labels.get(k) in vals:
+            return False
+        if op == "Exists" and k not in labels:
+            return False
+        if op == "DoesNotExist" and k in labels:
+            return False
+    return True
+
+
+def disruption_report(c, node_name):
+    """Workloads whose every ready replica runs on node_name, and PDBs that block the drain."""
+    pods = c.kjson("get", "pods", "-A")["items"]
+    rs_owner = {}
+    for rs in c.kjson("get", "replicasets", "-A")["items"]:
+        o = (rs["metadata"].get("ownerReferences") or [{}])[0]
+        if o.get("kind"):
+            rs_owner[(rs["metadata"]["namespace"], rs["metadata"]["name"])] = f"{o['kind']}/{o['name']}"
+
+    def ready(p):
+        return p["status"].get("phase") == "Running" and any(
+            c_["type"] == "Ready" and c_["status"] == "True" for c_ in p["status"].get("conditions", []))
+
+    def workload(p):
+        ns = p["metadata"]["namespace"]
+        o = (p["metadata"].get("ownerReferences") or [{}])[0]
+        kind, name = o.get("kind"), o.get("name")
+        if kind == "ReplicaSet":
+            return ns + "/" + rs_owner.get((ns, name), f"ReplicaSet/{name}")
+        if kind:
+            return f"{ns}/{kind}/{name}"
+        return f"{ns}/Pod/{p['metadata']['name']}"
+
+    on_node, total_ready, node_ready = [], {}, {}
+    for p in pods:
+        if p["status"].get("phase") in ("Succeeded", "Failed"):
+            continue
+        if "kubernetes.io/config.mirror" in p["metadata"].get("annotations", {}):
+            continue
+        o = (p["metadata"].get("ownerReferences") or [{}])[0]
+        if o.get("kind") in SKIP_OWNERS:
+            continue
+        w = workload(p)
+        if ready(p):
+            total_ready[w] = total_ready.get(w, 0) + 1
+        if p["spec"].get("nodeName") == node_name:
+            on_node.append(p)
+            if ready(p):
+                node_ready[w] = node_ready.get(w, 0) + 1
+
+    # down = workloads that are serving now and whose every ready replica runs on this node
+    down = sorted({w for w in map(workload, on_node)
+                   if total_ready.get(w, 0) > 0 and total_ready.get(w, 0) - node_ready.get(w, 0) == 0})
+    blockers = []
+    for pdb in c.kjson("get", "pdb", "-A")["items"]:
+        ns = pdb["metadata"]["namespace"]
+        if ns == "longhorn-system" and pdb["metadata"]["name"].startswith("instance-manager"):
+            continue  # managed by Longhorn during drains
+        if pdb.get("status", {}).get("disruptionsAllowed", 1) > 0:
+            continue
+        sel = pdb["spec"].get("selector") or {}
+        if any(p["metadata"]["namespace"] == ns and selector_match(sel, p["metadata"].get("labels", {}))
+               for p in on_node):
+            blockers.append(f"{ns}/{pdb['metadata']['name']}")
+    return down, blockers
+
+
+# ---------------------------------------------------------------- talos specifics
+
+def talosctl_for(version):
+    """talosctl matching the running cluster version (as recommended by Sidero)."""
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), "amd64")
+    path = os.path.join(CACHE_DIR, f"talosctl-{vs(version)}")
+    if os.path.exists(path):
+        return path
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    base = f"https://github.com/siderolabs/talos/releases/download/{vs(version)}"
+    log(f"downloading talosctl {vs(version)}")
+    _, binary = http_get(f"{base}/talosctl-linux-{arch}", timeout=300)
+    _, sums = http_get(f"{base}/sha256sum.txt")
+    want = next((l.split()[0] for l in sums.decode().splitlines() if l.endswith(f"talosctl-linux-{arch}")), None)
+    if not want or hashlib.sha256(binary).hexdigest() != want:
+        raise RuntimeError(f"talosctl {vs(version)}: checksum mismatch")
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(binary)
+    os.chmod(tmp, 0o755)
+    os.rename(tmp, path)
+    return path
+
+
+def kernel_args(cfg):
+    """machine.install.extraKernelArgs of a machine config: block or flow style, possibly empty."""
+    m = re.search(r"^([ \t]*)extraKernelArgs:[ \t]*([^\n]*)", cfg, re.M)
+    if not m:
+        return []
+    rest = re.sub(r"(^|\s)#.*", "", m.group(2)).strip()
+    if rest.startswith("["):
+        start = m.start(2) + m.group(2).index("[") + 1
+        end = cfg.find("]", start)
+        items = cfg[start:end if end >= 0 else len(cfg)].split(",")
+    elif rest:
+        return []  # null, ~ or another scalar
+    else:
+        items, indent = [], len(m.group(1))
+        for line in cfg[m.end():].splitlines()[1:]:
+            if not line.strip() or line.strip().startswith("#"):
+                continue
+            item = re.match(r"^([ \t]*)-[ \t]+(.*)$", line)
+            if not item or len(item.group(1)) < indent:
+                break
+            items.append(item.group(2))
+    args = (re.sub(r"\s+#.*", "", i).strip().strip("'\"") for i in items)
+    return [a for a in args if a]
+
+
+def node_image_info(c, node, nodes):
+    """Installed system extensions {name: version} (incl. schematic) and extraKernelArgs of a node."""
+    ep = c.endpoint_for(node["ip"], nodes)
+    ext = c.talosctl("get", "extensions", endpoint=ep, nodes=node["ip"]).stdout
+    names = {}
+    for line in ext.splitlines()[1:]:
+        tok = line.split()
+        if len(tok) >= 2:
+            names[tok[-2]] = tok[-1]
+    cfg = c.talosctl("read", "/system/state/config.yaml", endpoint=ep, nodes=node["ip"]).stdout
+    return names, kernel_args(cfg)
+
+
+def node_cmdline(c, node, nodes):
+    ep = c.endpoint_for(node["ip"], nodes)
+    return c.talosctl("read", "/proc/cmdline", endpoint=ep, nodes=node["ip"]).stdout.split()
+
+
+def installer_image(schematic, extensions, repo_override, version):
+    if repo_override:
+        return f"{repo_override}:{vs(version)}"
+    if schematic and schematic != VANILLA_SCHEMATIC:
+        return f"factory.talos.dev/installer/{schematic}:{vs(version)}"
+    if extensions:
+        raise RuntimeError("system extensions installed without an Image Factory schematic: "
+                           "pass --image-repo with the custom installer repository")
+    return f"ghcr.io/siderolabs/installer:{vs(version)}"
+
+
+def image_exists(image):
+    m = re.match(r"^([^/]+)/(.+):([^:/]+)$", image)
+    if not m or not (re.search(r"[.:]", m.group(1)) or m.group(1) == "localhost"):
+        raise RuntimeError(f"installer image {image!r} has no registry host: "
+                           "--image-repo must look like registry.example.com/org/installer")
+    reg, repo, tag = m.groups()
+    if reg == "ghcr.io":
+        try:
+            _, tok = http_get(f"https://ghcr.io/token?scope=repository:{repo}:pull")
+            token = json.loads(tok)["token"]
+        except Exception:
+            return False
+        headers = {"Authorization": f"Bearer {token}"}
+    else:
+        headers = {}
+    headers["Accept"] = ("application/vnd.oci.image.index.v1+json,"
+                         "application/vnd.docker.distribution.manifest.list.v2+json,"
+                         "application/vnd.oci.image.manifest.v1+json")
+    try:
+        req = urllib.request.Request(f"https://{reg}/v2/{repo}/manifests/{tag}", headers=headers, method="HEAD")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- certificates
+
+def cert_days(pem_b64):
+    pem = base64.b64decode(pem_b64)
+    p = subprocess.run(["openssl", "x509", "-noout", "-enddate"], input=pem, capture_output=True)
+    end = p.stdout.decode().strip().split("=", 1)[1]
+    exp = dt.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z")
+    return (exp - dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)).days
+
+
+def check_certs(c):
+    out = []
+    kc = json.loads(c.kubectl("config", "view", "--raw", "-o", "json").stdout)
+    for u in kc.get("users", []):
+        d = u.get("user", {}).get("client-certificate-data")
+        if d:
+            out.append(("kubeconfig " + u["name"], cert_days(d)))
+    for m in re.finditer(r"^\s*crt:\s*(\S+)", open(c.talosconfig).read(), re.M):
+        out.append(("talosconfig", cert_days(m.group(1))))
+    return out
+
+
+# ---------------------------------------------------------------- plan
+
+def build_plan(nodes, releases, target, with_k8s):
+    """Steps from the lowest running Talos to `target` (default: newest release):
+    latest patch of every intermediate release line, plus the Kubernetes minors
+    needed to stay inside each line's support matrix."""
+    cur_talos = min(n["talos"] for n in nodes)
+    cur_k8s = min(n["kubelet"] for n in nodes)
+    if any(n["talos"][:2] != cur_talos[:2] for n in nodes):
+        log("nodes run different Talos release lines: the lowest one is the starting point; "
+            "nodes at or above a step are skipped, never downgraded", "WARN")
+    if cur_k8s[0] != 1:
+        raise RuntimeError(f"unsupported Kubernetes version {vs(cur_k8s)}")
+    if target and target[:2] not in releases:
+        raise RuntimeError(f"Talos {target[0]}.{target[1]} has no stable release")
+    final = target or releases[max(releases)]
+    if final < cur_talos:
+        raise RuntimeError(f"target {vs(final)} is older than the running {vs(cur_talos)}")
+    if target and target[:2] in releases and target > releases[target[:2]]:
+        raise RuntimeError(f"target {vs(target)} is not a published stable release")
+    steps, k8s, talos = [], cur_k8s[1], cur_talos
+    for line in sorted(l for l in releases if cur_talos[:2] <= l <= final[:2]):
+        nxt = final if line == final[:2] else releases[line]
+        if nxt <= talos:
+            continue
+        name = "%d.%d" % line
+        sup = k8s_support(line)
+        while k8s not in sup:
+            if k8s > max(sup):
+                raise RuntimeError(f"Talos {name} does not support Kubernetes 1.{k8s}")
+            if not with_k8s:
+                return steps, (f"Talos {name} needs Kubernetes 1.{min(sup)}+ (running 1.{k8s}): "
+                               "rerun with --with-k8s to include the Kubernetes upgrades")
+            if k8s + 1 not in k8s_support(talos[:2]):
+                raise RuntimeError(f"Kubernetes 1.{k8s + 1} not supported by Talos {vs(talos)}")
+            k8s += 1
+            steps.append(("k8s", k8s_latest_patch(k8s), talos))
+        steps.append(("talos", nxt, talos))
+        talos = nxt
+    return steps, None
+
+
+# ---------------------------------------------------------------- execution
+
+def cordon_node(c, name):
+    """Cordon a node and mark it as cordoned by kupdate: only marked nodes are ever uncordoned."""
+    c.kubectl("annotate", "node", name, f"{CORDON_MARK}=true", "--overwrite")
+    c.kubectl("cordon", name)
+
+
+def release_node(c, name):
+    """Uncordon a node cordoned by kupdate and remove the mark. True on success."""
+    try:
+        p = c.kubectl("uncordon", name, check=False)
+        if p.returncode == 0:
+            c.kubectl("annotate", "node", name, f"{CORDON_MARK}-", check=False)
+            log(f"{name} uncordoned")
+            return True
+        err = p.stderr.strip()[:200]
+    except subprocess.TimeoutExpired as e:
+        err = str(e)
+    log(f"uncordon of {name} failed: {err}", "ERROR")
+    return False
+
+
+def release_or_stop(c, name, timeout=300):
+    deadline = time.time() + timeout
+    while not release_node(c, name):
+        if time.time() > deadline:
+            stop(f"cannot uncordon {name} for {timeout // 60} min")
+        time.sleep(15)
+
+
+def report_cordoned(c):
+    nodes, err = safe(c.nodes)
+    if err is not None:
+        log(f"cannot list the nodes to look for cordons left by kupdate: {err}", "ERROR")
+        return
+    left = [n["name"] for n in nodes if n["kupdate"] and n["unschedulable"]]
+    if left:
+        log(f"left cordoned by kupdate: {', '.join(left)}; the next run uncordons them once Ready "
+            "(or run 'kubectl uncordon' yourself)", "ERROR")
+    else:
+        log("no node left cordoned by kupdate")
+
+
+def verify_node_image(c, node, expect):
+    """Stop if an upgraded node lost a system extension, changed schematic or dropped an active kernel arg."""
+    name = node["name"]
+    if name not in expect["ext"]:
+        log(f"{name} was not seen at start: extensions and kernel args not checked", "WARN")
+        return
+    nodes = retry(c.nodes, what="kubectl get nodes")
+    names, _ = retry(node_image_info, c, node, nodes, what=f"reading the extensions of {name}")
+    before = expect["ext"][name]
+    probs = []
+    if set(names) != set(before) or names.get("schematic") != before.get("schematic"):
+        probs.append(f"extensions {sorted(before)} -> {sorted(names)}, "
+                     f"schematic {before.get('schematic')} -> {names.get('schematic')}")
+    want = expect["kargs"].get(name, [])
+    if want:
+        cmdline = retry(node_cmdline, c, node, nodes, what=f"reading /proc/cmdline of {name}")
+        lost = [a for a in want if a not in cmdline]
+        if lost:
+            probs.append(f"kernel args missing from /proc/cmdline: {' '.join(lost)}")
+    if probs:
+        safe(lambda: c.kubectl("annotate", "node", name, f"{CORDON_MARK}-", check=False))
+        stop(f"{name} changed by the upgrade: {'; '.join(probs)}. It stays cordoned on purpose: "
+             f"fix it, then 'kubectl uncordon {name}' and run kupdate again")
+    log(f"{name}: extensions{' and kernel args' if want else ''} preserved")
+
+
+def upgrade_node(c, node, version, image, binary, legacy, args, baseline, mon, expect):
+    nodes = retry(c.nodes, what="kubectl get nodes")
+    node = next(n for n in nodes if n["name"] == node["name"])
+    name = node["name"]
+    if node["talos"] >= version:
+        log(f"{name} at {vs(node['talos'])} (>= {vs(version)}), skipped")
+        if node["kupdate"] and node["ready"]:
+            release_or_stop(c, name)  # left cordoned by an interrupted run
+        return
+    if node["unschedulable"] and not node["kupdate"]:
+        stop(f"{name} was cordoned outside kupdate: uncordon it (or wait for whoever cordoned it), then run again")
+    log(f"=== {name} ({node['ip']}, {'control plane' if node['cp'] else 'worker'}): "
+        f"{vs(node['talos'])} -> {vs(version)}")
+    wait_healthy(c, baseline, 15 * 60, f"before {name}")
+    down, blockers = retry(disruption_report, c, name, what="disruption check")
+    if blockers:
+        stop(f"PodDisruptionBudgets would block the drain of {name}: {', '.join(blockers)}")
+    if down:
+        msg = f"draining {name} would stop every ready replica of: {', '.join(down)}"
+        if not args.allow_disruption:
+            stop(msg + " (downtime; use --allow-disruption to accept it)")
+        log(msg + " - accepted with --allow-disruption", "WARN")
+        mon and mon.grace.set()
+    nodes = retry(c.nodes, what="kubectl get nodes")
+    ep = c.endpoint_for(node["ip"], nodes)
+
+    drain_log = os.path.join(STATE_DIR, f"{c.env}-drain-{name}.log")
+    log(f"cordon + drain {name} (output in {drain_log})")
+    cordon_node(c, name)
+    with open(drain_log, "w+") as logf:
+        drain = subprocess.Popen(["kubectl", "--kubeconfig", c.kubeconfig, "drain", name,
+                                  "--ignore-daemonsets", "--delete-emptydir-data",
+                                  f"--timeout={args.drain_timeout}m"],
+                                 stdout=logf, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        deadline = time.time() + args.drain_timeout * 60 + 120
+        while drain.poll() is None:
+            if ABORT.is_set() or time.time() > deadline:
+                drain.kill()
+                drain.wait()
+                log(f"drain of {name} interrupted", "ERROR")
+                release_node(c, name)
+                stop(ABORT_REASON[0] if ABORT.is_set() else
+                     f"drain of {name} still running {args.drain_timeout + 2} min after the start (log {drain_log})")
+            time.sleep(2)
+        logf.seek(0)
+        out = logf.read()
+    if drain.returncode != 0:
+        release_node(c, name)
+        stop(f"drain of {name} failed (log {drain_log}): {out.strip()[-500:]}")
+    if ABORT.is_set():  # a check failed while the drain was finishing: do not reboot the node
+        release_node(c, name)
+        checkpoint()
+
+    cmd = ["upgrade", "--image", image, "--wait", "--timeout", "30m"]
+    if legacy:
+        cmd.append("--legacy")
+    if node["talos"] < (1, 13, 0) and "--preserve" in c.run([binary, "upgrade", "--help"], check=False).stdout:
+        cmd.append("--preserve")  # legacy API: keep EPHEMERAL (e.g. Longhorn data) explicitly
+    log(f"talosctl {' '.join(cmd)} (endpoint {ep}); this step is never interrupted")
+    p = subprocess.Popen([binary, "--talosconfig", c.talosconfig, "-e", ep, "-n", node["ip"], *cmd],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    for line in p.stdout:
+        if line.strip():
+            log("  " + line.rstrip())
+    p.wait()
+    if p.returncode != 0:
+        stop(f"talosctl upgrade of {name} failed (rc {p.returncode}); check with "
+             f"'talosctl -e {ep} -n {node['ip']} dmesg' - rollback: 'talosctl -e {ep} -n {node['ip']} rollback'")
+
+    deadline = time.time() + 20 * 60
+    last_err = None
+    while True:
+        now, err = safe(c.nodes)
+        if err is not None and err != last_err:
+            log(f"waiting for {name}: {err}", "WARN")
+        last_err = err
+        n = next((x for x in now or [] if x["name"] == name), None)
+        if n and n["ready"] and n["talos"] == version:
+            break
+        if time.time() > deadline:
+            stop(f"{name} not Ready on {vs(version)} 20 min after the upgrade"
+                 + (f" (last error: {err})" if err else ""))
+        time.sleep(15)
+    log(f"{name} Ready on {vs(version)}")
+    verify_node_image(c, n, expect)
+    release_or_stop(c, name)
+
+    if mon and mon.grace.is_set():
+        deadline = time.time() + args.recover_timeout * 60
+        while mon.down():
+            if time.time() > deadline:
+                mon.grace.clear()
+                stop(f"endpoints still down {args.recover_timeout} min after {name}: {', '.join(mon.down())}")
+            time.sleep(10)
+        mon.grace.clear()
+        log("all endpoints answering again")
+    wait_healthy(c, baseline, args.longhorn_timeout * 60, f"after {name}")
+    if node["cp"]:
+        talos_health(c, retry(c.nodes, what="kubectl get nodes"), binary)
+
+
+def k8s_upgrade_cmd(c, binary, talos_version, version, prune):
+    """upgrade-k8s arguments: with talosctl >= 1.13 bootstrap manifests are not pruned unless prune."""
+    cmd = ["upgrade-k8s", "--to", vs(version)[1:]]
+    if not prune:
+        if "--manifests-no-prune" in c.run([binary, "upgrade-k8s", "--help"], check=False).stdout:
+            cmd.append("--manifests-no-prune")
+        elif talos_version >= (1, 13, 0):
+            raise RuntimeError(f"talosctl {vs(talos_version)} has no --manifests-no-prune: "
+                               "rerun with --k8s-prune to accept manifest pruning")
+    return cmd
+
+
+def k8s_dry_run(c, cmd, binary, ep, cp_ip):
+    """upgrade-k8s --dry-run (read-only), whole output logged. Returns (ok, output)."""
+    p = c.talosctl(*cmd, "--dry-run", endpoint=ep, nodes=cp_ip, binary=binary, check=False, timeout=1800)
+    out = (p.stdout + p.stderr).strip()
+    for l in out.splitlines():
+        if l.strip():
+            log("  dry-run: " + l.rstrip(), "WARN" if re.search(r"remov|deprecat|prun|WARNING", l, re.I) else "INFO")
+    return p.returncode == 0, out
+
+
+def upgrade_k8s(c, version, talos_version, baseline, prune):
+    nodes = retry(c.nodes, what="kubectl get nodes")
+    cp = next(n for n in nodes if n["cp"])
+    ep = c.endpoint_for(cp["ip"], nodes)
+    binary = talosctl_for(talos_version)
+    c.talosctl_default = binary
+    log(f"=== Kubernetes -> {vs(version)} (talosctl {vs(talos_version)})")
+    wait_healthy(c, baseline, 15 * 60, "before Kubernetes upgrade")
+    cmd = k8s_upgrade_cmd(c, binary, talos_version, version, prune)
+    ok, out = k8s_dry_run(c, cmd, binary, ep, cp["ip"])
+    if not ok:
+        stop("upgrade-k8s --dry-run failed: " + out[-800:])
+    log(f"talosctl {' '.join(cmd)} (endpoint {ep})")
+    p = subprocess.Popen([binary, "--talosconfig", c.talosconfig, "-e", ep, "-n", cp["ip"], *cmd],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    for line in p.stdout:
+        if line.strip():
+            log("  " + line.rstrip())
+    p.wait()
+    if p.returncode != 0:
+        stop(f"upgrade-k8s to {vs(version)} failed (rc {p.returncode})")
+    wait_healthy(c, baseline, 30 * 60, f"after Kubernetes {vs(version)}")
+    talos_health(c, retry(c.nodes, what="kubectl get nodes"), binary)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("env")
+    ap.add_argument("--plan", action="store_true", help="read-only checks and plan, change nothing")
+    ap.add_argument("--to", help="final Talos version (default: newest reachable)")
+    ap.add_argument("--with-k8s", action="store_true",
+                    help="upgrade Kubernetes one minor at a time when the next Talos needs it")
+    ap.add_argument("--k8s-prune", action="store_true",
+                    help="let upgrade-k8s prune bootstrap manifests (talosctl >= 1.13; "
+                         "default: --manifests-no-prune)")
+    ap.add_argument("--allow-disruption", action="store_true",
+                    help="drain nodes even if a workload loses all its ready replicas")
+    ap.add_argument("--image-repo", help="installer repository (default: Image Factory schematic of the nodes)")
+    ap.add_argument("--endpoints", help="extra URLs to monitor, one per line "
+                                        "(default ~/.config/kupdate/endpoints-ENV.txt); "
+                                        "use internal URLs, not URLs behind a WAF")
+    ap.add_argument("--interval", type=int, default=30, help="endpoint check interval, s (30)")
+    ap.add_argument("--fail-after", type=int, default=3, help="consecutive endpoint failures that stop (3)")
+    ap.add_argument("--drain-timeout", type=int, default=20, help="minutes (20)")
+    ap.add_argument("--longhorn-timeout", type=int, default=60,
+                    help="minutes to wait for volumes/workloads after a node (60)")
+    ap.add_argument("--recover-timeout", type=int, default=10,
+                    help="minutes for endpoints to recover after an allowed disruption (10)")
+    ap.add_argument("--kubeconfig", help="kubeconfig file (overrides the ENV pattern)")
+    ap.add_argument("--talosconfig", help="talosconfig file (overrides the ENV pattern)")
+    ap.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    args = ap.parse_args()
+
+    env = args.env
+    kubeconfig = os.path.expanduser(args.kubeconfig or os.environ.get(
+        "KUPDATE_KUBECONFIG", "~/.kube/config-{env}").format(env=env))
+    talosconfig = os.path.expanduser(args.talosconfig or os.environ.get(
+        "KUPDATE_TALOSCONFIG", "~/TalosLinux/{env}/talosconfig").format(env=env))
+    for f in (kubeconfig, talosconfig):
+        if not os.path.exists(f):
+            sys.exit(f"missing {f}")
+    extra = args.endpoints or os.path.join(HOME, ".config", "kupdate", f"endpoints-{env}.txt")
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, f"{env}.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(f"another kupdate {env} is running")
+    global LOG
+    LOG = open(os.path.join(STATE_DIR, f"{env}-{dt.datetime.now():%Y%m%d-%H%M%S}"
+                                       f"{'-plan' if args.plan else ''}.log"), "w")
+
+    c = Cluster(env, kubeconfig, talosconfig)
+    mon = None
+    blocked = []  # --plan: reasons why the real run would refuse to start
+    try:
+        ctx = c.kubectl("config", "current-context").stdout.strip()
+        api = c.kubectl("cluster-info").stdout.splitlines()[0]
+        api = re.sub(r"\x1b\[[0-9;]*m", "", api)
+        log(f"environment {env}: context {ctx}, {api}")
+        nodes = c.nodes()
+        cps = [n for n in nodes if n["cp"]]
+        log(f"{len(cps)} control planes, {len(nodes) - len(cps)} workers")
+        for n in nodes:
+            cordon = ("  CORDONED by kupdate" if n["kupdate"] else "  CORDONED") if n["unschedulable"] else ""
+            log(f"  {n['name']:28} {n['ip']:16} Talos {vs(n['talos'])}  kubelet {vs(n['kubelet'])}"
+                f"{'' if n['ready'] else '  NOT READY'}{cordon}")
+        if len(cps) < 3:
+            sys.exit("fewer than 3 control planes: a rolling upgrade without downtime is not possible")
+        kc = json.loads(c.kubectl("config", "view", "--minify", "-o", "json").stdout)
+        server = kc["clusters"][0]["cluster"]["server"]
+        api_cp = next((n["name"] for n in cps if n["ip"] == urllib.parse.urlparse(server).hostname), None)
+        if api_cp:
+            log(f"kubeconfig server {server} is control plane {api_cp}: the Kubernetes API is down while "
+                "that node reboots (checks retry, but a VIP or load balancer is better)", "WARN")
+
+        foreign = [n["name"] for n in nodes if n["unschedulable"] and not n["kupdate"]]
+        if foreign:
+            msg = f"nodes cordoned outside kupdate: {', '.join(foreign)} (uncordon them or wait for whoever did it)"
+            if not args.plan:
+                stop(msg)
+            log(msg, "ERROR")
+            blocked.append(msg)
+        released = False
+        for n in nodes:
+            if not n["kupdate"]:
+                continue
+            if not n["ready"]:
+                log(f"{n['name']} was cordoned by an interrupted kupdate run and is not Ready", "WARN")
+            elif args.plan:
+                log(f"{n['name']} was cordoned by an interrupted kupdate run: the real run uncordons it", "WARN")
+            elif release_node(c, n["name"]):
+                released = True
+            else:
+                stop(f"cannot uncordon {n['name']}")
+        if released:
+            nodes = c.nodes()
+        c.talosctl_default = talosctl_for(min(n["talos"] for n in nodes))
+
+        for name, days in check_certs(c):
+            level = "ERROR" if days < 2 else "WARN" if days < 14 else "INFO"
+            log(f"certificate {name}: expires in {days} days", level)
+            if days < 2:
+                stop(f"{name} certificate expires in {days} days: renew it first")
+
+        exts, kargs_active = {}, {}
+        legacy = False
+        for n in nodes:
+            names, kargs = node_image_info(c, n, nodes)
+            exts[n["name"]] = names
+            if kargs:
+                legacy = True
+                cmdline = node_cmdline(c, n, nodes)
+                kargs_active[n["name"]] = [a for a in kargs if a in cmdline]
+                inactive = [a for a in kargs if a not in cmdline]
+                if inactive:
+                    log(f"{n['name']}: extraKernelArgs not on the running kernel command line "
+                        f"(not checked after the upgrade): {' '.join(inactive)}", "WARN")
+        schematics = {e.get("schematic") for e in exts.values()}
+        if len(schematics) != 1:
+            stop(f"nodes use different Image Factory schematics: {schematics}")
+        schematic = schematics.pop()
+        others = sorted({k for e in exts.values() for k in e if k != "schematic"})
+        log(f"extensions: {', '.join(f'{k} {v}' for k, v in exts[nodes[0]['name']].items()) or 'none'}")
+        if legacy:
+            log("machine config has extraKernelArgs: upgrades use --legacy on talosctl >= 1.13 "
+                "and /proc/cmdline is checked after every node", "WARN")
+
+        releases = talos_releases()
+        target = vt(args.to) if args.to else None
+        steps, limit = build_plan(nodes, releases, target, args.with_k8s)
+        log("upgrade path:")
+        for kind, ver, frm in steps:
+            if kind == "talos":
+                img = installer_image(schematic, others, args.image_repo, ver)
+                ok = image_exists(img)
+                log(f"  Talos {vs(frm)} -> {vs(ver)}  image {img}  {'OK' if ok else 'NOT FOUND'}")
+                if not ok:
+                    stop(f"installer image {img} not found")
+            else:
+                log(f"  Kubernetes -> {vs(ver)} (with talosctl {vs(frm)})")
+        if limit:
+            log(f"path stops here: {limit}", "WARN")
+        if not steps:
+            if limit:
+                log("nothing can be upgraded until the Kubernetes requirement above is met", "ERROR")
+                return 1
+            log("nothing to upgrade")
+            return 0
+
+        c.longhorn = detect_longhorn(c)
+        log("Longhorn " + ("installed: volume robustness is checked" if c.longhorn else "not installed"))
+        baseline = {"unhealthy": unhealthy_workloads(c)}
+        if baseline["unhealthy"]:
+            log("not ready before starting (ignored by the checks): " + ", ".join(sorted(baseline["unhealthy"])), "WARN")
+        probs = cluster_problems(c, baseline)
+        if probs:
+            stop("cluster not healthy before starting: " + "; ".join(probs))
+        log("cluster checks OK (nodes, etcd, Longhorn, workloads)")
+        if args.plan and any(n["unschedulable"] for n in nodes):
+            log("talosctl health skipped: it fails while nodes are cordoned (see above)", "WARN")
+        else:
+            talos_health(c, nodes, c.talosctl_default, wait=3)
+
+        urls = discover_endpoints(c, extra)
+        m0 = EndpointMonitor(urls, args.interval, args.fail_after)
+        r1, r2 = m0.round(), m0.round()
+        good = [u for u in urls if 0 < r1[u] < 500 and 0 < r2[u] < 500]
+        for u in urls:
+            if u not in good:
+                log(f"endpoint {u} not answering at start ({r1[u] or 'no answer'} / {r2[u] or 'no answer'}): "
+                    "not monitored", "WARN")
+        log(f"{len(good)} endpoints monitored every {args.interval}s, stop after {args.fail_after} failures")
+
+        log("disruption check (current placement; repeated before every node):")
+        n_blocked = 0
+        for n in nodes:
+            down, blockers = disruption_report(c, n["name"])
+            if down or blockers:
+                n_blocked += 1
+                log(f"  {n['name']}: " + "; ".join(
+                    ([f"would stop {', '.join(down)}"] if down else []) +
+                    ([f"PDB blocks drain: {', '.join(blockers)}"] if blockers else [])), "WARN")
+            else:
+                log(f"  {n['name']}: OK")
+        if n_blocked and not args.allow_disruption:
+            log(f"{n_blocked} node(s) cannot be drained without downtime: the run would stop there "
+                "(add replicas / anti-affinity, or accept with --allow-disruption)", "WARN")
+
+        if args.plan:
+            k8s_step = next((s for s in steps if s[0] == "k8s"), None)
+            if k8s_step:
+                _, ver, frm = k8s_step
+                cur = min(n["talos"] for n in nodes)
+                binary = talosctl_for(frm)
+                log(f"upgrade-k8s dry-run to {vs(ver)} with talosctl {vs(frm)} (read-only):")
+                ok, _ = k8s_dry_run(c, k8s_upgrade_cmd(c, binary, frm, ver, args.k8s_prune), binary,
+                                    c.endpoint_for(cps[0]["ip"], nodes), cps[0]["ip"])
+                if ok:
+                    log("upgrade-k8s dry-run OK")
+                elif frm == cur:
+                    msg = f"upgrade-k8s --dry-run to {vs(ver)} failed (output above)"
+                    log(msg, "ERROR")
+                    blocked.append(msg)
+                else:
+                    log(f"upgrade-k8s --dry-run to {vs(ver)} failed against the current Talos {vs(cur)}; "
+                        f"the run repeats it once the cluster is on Talos {vs(frm)}", "WARN")
+            if blocked:
+                log("plan only, nothing changed; the run would refuse to start: " + "; ".join(blocked), "ERROR")
+                return 1
+            log("plan only: nothing changed")
+            return 0
+
+        if not args.yes:
+            ans = input(f"\nUpgrade cluster '{env}' as above? Type the environment name to continue: ")
+            if ans.strip() != env:
+                log("not confirmed, nothing changed")
+                return 1
+
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, on_signal)
+        mon = EndpointMonitor(good, args.interval, args.fail_after)
+        mon.start()
+        expect = {"ext": exts, "kargs": kargs_active}
+        for kind, ver, frm in steps:
+            checkpoint()
+            if kind == "k8s":
+                upgrade_k8s(c, ver, frm, baseline, args.k8s_prune)
+                continue
+            log(f"##### Talos {vs(ver)}")
+            binary = talosctl_for(frm)
+            img = installer_image(schematic, others, args.image_repo, ver)
+            c.talosctl_default = binary
+            for n in retry(c.nodes, what="kubectl get nodes"):  # control planes first, then workers
+                upgrade_node(c, n, ver, img, binary, legacy and frm >= (1, 13, 0), args, baseline, mon, expect)
+            talos_health(c, retry(c.nodes, what="kubectl get nodes"), talosctl_for(ver))
+            log(f"##### cluster on Talos {vs(ver)}")
+        deadline = time.time() + args.recover_timeout * 60
+        while mon.down():
+            checkpoint()
+            if time.time() > deadline:
+                stop(f"endpoints not answering at the end: {', '.join(mon.down())}")
+            time.sleep(5)
+        checkpoint()
+        log("upgrade completed")
+        return 0
+    except Abort as e:
+        log(f"STOPPED: {e}", "ERROR")
+        if not args.plan:
+            report_cordoned(c)
+        log("fix the cause and run kupdate again (nodes already at the target version are skipped)", "ERROR")
+        return 1
+    except Exception as e:
+        log(f"STOPPED on unexpected error: {e}", "ERROR")
+        if not args.plan:
+            report_cordoned(c)
+        return 1
+    finally:
+        if mon:
+            mon.running.clear()
+        log(f"log: {LOG.name}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
