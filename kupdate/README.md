@@ -53,6 +53,27 @@ Extra URLs to monitor, for example the public URLs of the published services: on
 
 Logs: `~/.local/state/kupdate/ENV-<timestamp>.log`, drain output in `~/.local/state/kupdate/ENV-drain-<node>.log`.
 
+## Renew only the admin certificates
+
+```bash
+kupdate prod --certs --plan   # show the expiry of the talosconfig and kubeconfig client certificates
+kupdate prod --certs          # renew them (asks to type "prod" to confirm)
+```
+
+Nothing on the cluster changes: the new certificates are signed by the existing cluster CAs.
+
+1. **Talos certificate.** It is issued with `talosctl config new --roles os:admin` while the old one still works. Once it has expired, it is issued from the cluster `secrets.yaml` instead: `--secrets`, default `~/TalosLinux/ENV/secrets.yaml`.
+2. **Kubernetes certificate.** It is issued with `talosctl kubeconfig`.
+3. **What gets replaced.** Only the client certificate and key of the **current context** change: the endpoints, CAs, other contexts and other users in the files stay as they were. `~/.kube/config` is updated too when it is an exact copy of the environment's kubeconfig (as made by a context switcher).
+4. **Checks and backup.** Both new files are checked against the cluster before anything is replaced, and again afterwards. If the check after the replacement fails, the old files are restored automatically. The old files are kept (mode 600) in `~/.local/state/kupdate/certs-ENV-<timestamp>/backup`: delete that folder once everything works.
+5. **Upgrade runs check expiry too.** An upgrade run refuses to start when a certificate expires within 2 days.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--certs` | – | certificate renewal only |
+| `--crt-ttl` | `8760h` | validity of the new Talos client certificate |
+| `--secrets` | `~/TalosLinux/ENV/secrets.yaml` | used only if the Talos certificate already expired |
+
 ## Before the first real run
 
 - Run it inside `tmux` or `screen`, so that a dropped SSH session does not stop it halfway.

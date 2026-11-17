@@ -10,6 +10,8 @@ stops at the first problem.
 Usage:
   kupdate ENV --plan            read-only: checks, upgrade path, disruption report
   kupdate ENV [options]         run the upgrade (asks to type ENV to confirm)
+  kupdate ENV --certs [--plan]  only renew (or show) the admin client certificates
+                                of talosconfig and kubeconfig; nothing on the cluster changes
 
 ENV selects the configs (patterns overridable with environment variables):
   KUPDATE_KUBECONFIG   default ~/.kube/config-{env}       (or --kubeconfig FILE)
@@ -57,6 +59,7 @@ import re
 import signal
 import ssl
 import subprocess
+import shutil
 import sys
 import threading
 import time
@@ -642,23 +645,244 @@ def image_exists(image):
 # ---------------------------------------------------------------- certificates
 
 def cert_days(pem_b64):
+    """Days (with decimals, negative when expired) until the certificate expires."""
     pem = base64.b64decode(pem_b64)
     p = subprocess.run(["openssl", "x509", "-noout", "-enddate"], input=pem, capture_output=True)
     end = p.stdout.decode().strip().split("=", 1)[1]
     exp = dt.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z")
-    return (exp - dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)).days
+    return round((exp - dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)).total_seconds() / 86400, 1)
 
 
 def check_certs(c):
+    """[(name, days, used_by_this_run)]: only the current kubeconfig user and talosconfig context block upgrades."""
     out = []
     kc = json.loads(c.kubectl("config", "view", "--raw", "-o", "json").stdout)
+    cur = next((x["context"]["user"] for x in kc.get("contexts", []) if x["name"] == kc.get("current-context")), None)
     for u in kc.get("users", []):
         d = u.get("user", {}).get("client-certificate-data")
         if d:
-            out.append(("kubeconfig " + u["name"], cert_days(d)))
-    for m in re.finditer(r"^\s*crt:\s*(\S+)", open(c.talosconfig).read(), re.M):
-        out.append(("talosconfig", cert_days(m.group(1))))
+            out.append(("kubeconfig " + u["name"], cert_days(d), u["name"] == cur))
+    out.append(("talosconfig", cert_days(talosconfig_field(open(c.talosconfig).read(), "crt")), True))
     return out
+
+
+def talosconfig_context(text):
+    """(context name, block line range, endpoints) of the current context of a talosconfig."""
+    lines = text.splitlines()
+    m = re.search(r"^context:\s*(\S+)\s*$", text, re.M)
+    if not m:
+        raise RuntimeError("talosconfig: no current context")
+    name = m.group(1).strip("'\"")
+    start = next((i for i, l in enumerate(lines)
+                  if re.match(r"^\s+['\"]?" + re.escape(name) + r"['\"]?:\s*$", l)), None)
+    if start is None:
+        raise RuntimeError(f"talosconfig: context {name} not found")
+    ind = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip()) > ind):
+        end += 1
+    block = "\n".join(lines[start + 1:end])
+    eps = []
+    fm = re.search(r"^\s+endpoints:\s*\[(.*?)\]", block, re.M)
+    if fm:
+        eps = [e.strip().strip("'\"") for e in fm.group(1).split(",") if e.strip()]
+    else:
+        blines = block.splitlines()
+        i = next((j for j, l in enumerate(blines) if re.match(r"^\s+endpoints:\s*$", l)), None)
+        if i is not None:
+            for l in blines[i + 1:]:
+                m2 = re.match(r"^\s*-\s*(\S+)\s*$", l)
+                if not m2:
+                    break
+                eps.append(m2.group(1))
+    return name, (start + 1, end), [e.strip("'\"") for e in eps]
+
+
+def talosconfig_field(text, key):
+    _, (a, b), _ = talosconfig_context(text)
+    for l in text.splitlines()[a:b]:
+        m = re.match(r"^\s+" + key + r":\s*(\S+)\s*$", l)
+        if m:
+            return m.group(1).strip("'\"")
+    raise RuntimeError(f"talosconfig: no {key} in the current context")
+
+
+def talosconfig_with_cert(text, crt, key):
+    """Copy of `text` with crt/key of the current context replaced (everything else untouched)."""
+    lines = text.splitlines()
+    _, (a, b), _ = talosconfig_context(text)
+    done = set()
+    for i in range(a, b):
+        m = re.match(r"^(\s+)(crt|key):\s*\S+\s*$", lines[i])
+        if m:
+            lines[i] = f"{m.group(1)}{m.group(2)}: {crt if m.group(2) == 'crt' else key}"
+            done.add(m.group(2))
+    if done != {"crt", "key"}:
+        raise RuntimeError("talosconfig: crt/key not found in the current context")
+    return "\n".join(lines) + "\n"
+
+
+def write_private(path, data):
+    """Atomic replace of `path` (following symlinks), keeping owner and mode (capped at 0600)."""
+    path = os.path.realpath(path)
+    tmp = path + ".kupdate-tmp"
+    st = os.stat(path) if os.path.exists(path) else None
+    if st and st.st_uid != os.getuid():
+        raise RuntimeError(f"{path} belongs to uid {st.st_uid}, not to the current user: refusing to replace it")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fchmod(f.fileno(), (st.st_mode & 0o600) if st else 0o600)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def find_talosctl():
+    """talosctl on PATH, else the newest one cached by kupdate."""
+    if shutil.which("talosctl"):
+        return "talosctl"
+    cached = sorted((f for f in os.listdir(CACHE_DIR) if re.match(r"^talosctl-v[\d.]+$", f)),
+                    key=lambda f: vt(f.split("-", 1)[1])) if os.path.isdir(CACHE_DIR) else []
+    if cached:
+        return os.path.join(CACHE_DIR, cached[-1])
+    stop("talosctl not found on PATH nor in " + CACHE_DIR)
+
+
+def renew_certs(c, args, env):
+    """Renew the admin client certificates of talosconfig and kubeconfig (current context only).
+    Nothing on the cluster changes: the new certificates are signed by the existing cluster CAs."""
+    old_talos = open(c.talosconfig).read()
+    old_kube = open(c.kubeconfig).read()
+    ctx, _, eps = talosconfig_context(old_talos)
+    if not eps:
+        stop("talosconfig: no endpoints in the current context")
+    ep = eps[0]
+    old_talos_crt = talosconfig_field(old_talos, "crt")
+    talos_days = cert_days(old_talos_crt)
+    kraw = json.loads(c.kubectl("config", "view", "--raw", "-o", "json").stdout)
+    kctx = next((x for x in kraw.get("contexts", []) if x["name"] == kraw.get("current-context")), None)
+    if not kctx:
+        stop("kubeconfig: no current context")
+    kuser = kctx["context"]["user"]
+    udata = next((u["user"] for u in kraw.get("users", []) if u["name"] == kuser), {})
+    if "client-certificate-data" not in udata:
+        stop(f"kubeconfig user {kuser} has no embedded client certificate: nothing kupdate can renew")
+    old_kube_crt = udata["client-certificate-data"]
+    kube_days = cert_days(old_kube_crt)
+    others = [u["name"] for u in kraw.get("users", []) if u["name"] != kuser and "client-certificate-data" in u.get("user", {})]
+    secrets = os.path.expanduser(args.secrets or os.environ.get(
+        "KUPDATE_SECRETS", "~/TalosLinux/{env}/secrets.yaml").format(env=env))
+    log(f"talosconfig {c.talosconfig}: context {ctx}, endpoint {ep}, client certificate expires in {talos_days} days")
+    log(f"kubeconfig {c.kubeconfig}: user {kuser}, client certificate expires in {kube_days} days")
+    if others:
+        log(f"kubeconfig also holds {', '.join(others)}: not renewed here, and not checked by upgrades of {env}", "WARN")
+    if talos_days > 0:
+        method = f"talosctl config new (signed by the cluster through the Talos API), validity {args.crt_ttl}"
+    else:
+        method = f"talosctl gen config --with-secrets {secrets} (old certificate expired), validity 1 year"
+        if not os.path.exists(secrets):
+            stop(f"talos client certificate expired and {secrets} not found: pass --secrets")
+    log(f"new Talos certificate via {method}; new kubeconfig certificate via talosctl kubeconfig")
+    if args.plan:
+        log("plan only: nothing changed")
+        return 0
+    if not args.yes:
+        ans = input(f"\nRenew the admin certificates of '{env}'? Type the environment name to continue: ")
+        if ans.strip() != env:
+            log("not confirmed, nothing changed")
+            return 1
+
+    work = os.path.join(STATE_DIR, f"certs-{env}-{dt.datetime.now():%Y%m%d-%H%M%S}")
+    os.makedirs(work, mode=0o700)
+    log(f"working directory (holds new credentials until the end): {work}")
+    tc = find_talosctl()
+    if talos_days > 0:
+        v = c.run([tc, "--talosconfig", c.talosconfig, "-e", ep, "-n", ep, "version", "--short"], check=False)
+        m = re.search(r"Server:.*?Tag:\s*(v[\d.]+)", v.stdout, re.S)
+        if m:
+            tc = talosctl_for(vt(m.group(1)))
+        c.run([tc, "--talosconfig", c.talosconfig, "-e", ep, "-n", ep, "config", "new",
+               os.path.join(work, "talosconfig.generated"), "--roles", "os:admin", "--crt-ttl", args.crt_ttl])
+    else:
+        # only the talosconfig is generated: the cluster URL is not used
+        c.run([tc, "gen", "config", ctx, "https://127.0.0.1:6443", "--with-secrets", secrets,
+               "--output-types", "talosconfig", "--output", os.path.join(work, "talosconfig.generated")])
+    gen = open(os.path.join(work, "talosconfig.generated")).read()
+    os.chmod(os.path.join(work, "talosconfig.generated"), 0o600)
+    new_crt = re.search(r"^\s+crt:\s*(\S+)", gen, re.M).group(1)
+    new_key = re.search(r"^\s+key:\s*(\S+)", gen, re.M).group(1)
+    cand_talos = os.path.join(work, "talosconfig.new")
+    write_private(cand_talos, talosconfig_with_cert(old_talos, new_crt, new_key))
+    if c.run([tc, "--talosconfig", cand_talos, "-e", ep, "-n", ep, "version"], check=False).returncode != 0:
+        stop(f"the new talosconfig does not work: nothing replaced (files in {work})")
+    log(f"new talosconfig works, client certificate expires in {cert_days(new_crt)} days")
+
+    gen_kube = os.path.join(work, "kubeconfig.generated")
+    c.run([tc, "--talosconfig", cand_talos, "-e", ep, "-n", ep, "kubeconfig", gen_kube, "--force"])
+    os.chmod(gen_kube, 0o600)
+    graw = json.loads(c.run(["kubectl", "--kubeconfig", gen_kube, "config", "view", "--raw", "-o", "json"]).stdout)
+    gu = graw["users"][0]["user"]
+    crt_f, key_f = os.path.join(work, "client.crt"), os.path.join(work, "client.key")
+    write_private(crt_f, base64.b64decode(gu["client-certificate-data"]).decode())
+    write_private(key_f, base64.b64decode(gu["client-key-data"]).decode())
+    cand_kube = os.path.join(work, "kubeconfig.new")
+    write_private(cand_kube, old_kube)
+    c.run(["kubectl", "--kubeconfig", cand_kube, "config", "set-credentials", kuser,
+           f"--client-certificate={crt_f}", f"--client-key={key_f}", "--embed-certs=true"])
+    if c.run(["kubectl", "--kubeconfig", cand_kube, "get", "nodes"], check=False).returncode != 0:
+        stop(f"the new kubeconfig does not work: nothing replaced (files in {work})")
+    log(f"new kubeconfig works, client certificate expires in {cert_days(gu['client-certificate-data'])} days")
+
+    backup = os.path.join(work, "backup")
+    os.makedirs(backup, mode=0o700)
+    targets = [(os.path.realpath(c.talosconfig), cand_talos, old_talos),
+               (os.path.realpath(c.kubeconfig), cand_kube, old_kube)]
+    shared = os.path.realpath(os.path.join(HOME, ".kube", "config"))
+    if os.path.exists(shared) and shared != targets[1][0]:
+        shared_text = open(shared).read()
+        if shared_text == old_kube:
+            targets.append((shared, cand_kube, shared_text))  # copy made by a context switcher
+        elif old_kube_crt in shared_text:
+            log(f"{shared} holds the old certificate of {kuser} but differs from {c.kubeconfig}: "
+                "not updated, re-run your context switcher", "WARN")
+    for dst, _, before in targets:
+        if open(dst).read() != before:
+            stop(f"{dst} changed during the renewal: nothing replaced (new files in {work})")
+    for i, (dst, _, before) in enumerate(targets):
+        write_private(os.path.join(backup, f"{i}-{os.path.basename(dst)}"), before)
+    for dst, src, _ in targets:
+        write_private(dst, open(src).read())
+        log(f"replaced {dst} (backup in {backup})")
+    ok = False
+    for attempt in range(5):
+        ok_t = c.run([tc, "--talosconfig", c.talosconfig, "-e", ep, "-n", ep, "version"], check=False).returncode == 0
+        ok_k = c.run(["kubectl", "--kubeconfig", c.kubeconfig, "get", "nodes"], check=False).returncode == 0
+        if ok_t and ok_k:
+            ok = True
+            break
+        time.sleep(15)
+    if not ok:
+        # restore only files whose old certificate still works; never put back an expired one
+        restorable = (talos_days > 0, kube_days > 0, kube_days > 0)
+        for i, (dst, _, before) in enumerate(targets):
+            if restorable[min(i, 2)]:
+                write_private(dst, before)
+        stop(f"verification after the replacement failed (cluster unreachable?): old files restored where their "
+             f"certificate is still valid; checked new files and backup in {work}")
+    for f in (crt_f, key_f, gen_kube, os.path.join(work, "talosconfig.generated"), cand_talos, cand_kube):
+        os.remove(f)
+    log(f"certificates renewed for {env}. The backup in {backup} holds admin credentials: delete it once verified")
+    return 0
 
 
 # ---------------------------------------------------------------- plan
@@ -948,6 +1172,12 @@ def main():
                     help="minutes for endpoints to recover after an allowed disruption (10)")
     ap.add_argument("--kubeconfig", help="kubeconfig file (overrides the ENV pattern)")
     ap.add_argument("--talosconfig", help="talosconfig file (overrides the ENV pattern)")
+    ap.add_argument("--certs", action="store_true",
+                    help="only renew the admin client certificates of talosconfig and kubeconfig (no upgrade); "
+                         "with --plan only shows their expiry")
+    ap.add_argument("--crt-ttl", default="8760h", help="validity of the new Talos client certificate (8760h)")
+    ap.add_argument("--secrets", help="secrets.yaml used when the Talos client certificate already expired "
+                                      "(default ~/TalosLinux/{env}/secrets.yaml, env KUPDATE_SECRETS)")
     ap.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     args = ap.parse_args()
 
@@ -969,12 +1199,14 @@ def main():
         sys.exit(f"another kupdate {env} is running")
     global LOG
     LOG = open(os.path.join(STATE_DIR, f"{env}-{dt.datetime.now():%Y%m%d-%H%M%S}"
-                                       f"{'-plan' if args.plan else ''}.log"), "w")
+                                       f"{'-certs' if args.certs else ''}{'-plan' if args.plan else ''}.log"), "w")
 
     c = Cluster(env, kubeconfig, talosconfig)
     mon = None
     blocked = []  # --plan: reasons why the real run would refuse to start
     try:
+        if args.certs:
+            return renew_certs(c, args, env)
         ctx = c.kubectl("config", "current-context").stdout.strip()
         api = c.kubectl("cluster-info").stdout.splitlines()[0]
         api = re.sub(r"\x1b\[[0-9;]*m", "", api)
@@ -1018,11 +1250,13 @@ def main():
             nodes = c.nodes()
         c.talosctl_default = talosctl_for(min(n["talos"] for n in nodes))
 
-        for name, days in check_certs(c):
-            level = "ERROR" if days < 2 else "WARN" if days < 14 else "INFO"
-            log(f"certificate {name}: expires in {days} days", level)
-            if days < 2:
-                stop(f"{name} certificate expires in {days} days: renew it first")
+        for name, days, used in check_certs(c):
+            level = ("ERROR" if used else "WARN") if days < 2 else "WARN" if days < 30 else "INFO"
+            log(f"certificate {name}: expires in {days} days{'' if used else ' (not used by this run)'}", level)
+            if used and days < 2:
+                stop(f"{name} certificate expires in {days} days: renew it first with 'kupdate {env} --certs'")
+            if used and days < 30:
+                log(f"renew it with 'kupdate {env} --certs' before a long upgrade", "WARN")
 
         exts, kargs_active = {}, {}
         legacy = False
@@ -1167,13 +1401,13 @@ def main():
         return 0
     except Abort as e:
         log(f"STOPPED: {e}", "ERROR")
-        if not args.plan:
+        if not args.plan and not args.certs:
             report_cordoned(c)
         log("fix the cause and run kupdate again (nodes already at the target version are skipped)", "ERROR")
         return 1
     except Exception as e:
         log(f"STOPPED on unexpected error: {e}", "ERROR")
-        if not args.plan:
+        if not args.plan and not args.certs:
             report_cordoned(c)
         return 1
     finally:
